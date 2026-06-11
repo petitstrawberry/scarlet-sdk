@@ -2124,10 +2124,7 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
         if src_path.is_symlink() {
             let link_target = fs::read_link(&src_path)
                 .map_err(|e| format!("failed to read symlink {}: {e}", src_path.display()))?;
-            if dst_path.exists() {
-                fs::remove_file(&dst_path)
-                    .map_err(|e| format!("failed to remove {}: {e}", dst_path.display()))?;
-            }
+            remove_existing_path(&dst_path)?;
             std::os::unix::fs::symlink(&link_target, &dst_path).map_err(|e| {
                 format!(
                     "failed to create symlink {} -> {}: {e}",
@@ -2148,6 +2145,17 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn remove_existing_path(path: &Path) -> Result<(), String> {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return Ok(());
+    };
+    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        fs::remove_dir_all(path).map_err(|e| format!("failed to remove {}: {e}", path.display()))
+    } else {
+        fs::remove_file(path).map_err(|e| format!("failed to remove {}: {e}", path.display()))
+    }
 }
 
 fn fetch_url_cached(
@@ -3750,6 +3758,27 @@ hash = "sha256:abc"
         apply_copy_layer(&file, &staging, &cache, None, &tpl_ctx, &mut layer_locks).unwrap();
 
         assert!(staging.join("data/config/system/linux-aarch64").is_dir());
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn copy_dir_replaces_existing_dangling_symlink() {
+        let temp =
+            std::env::temp_dir().join(format!("cargo-scarlet-symlink-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp);
+        let source = temp.join("source");
+        let dest = temp.join("dest");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&dest).unwrap();
+        std::os::unix::fs::symlink("/missing-target", source.join("udevadm")).unwrap();
+        std::os::unix::fs::symlink("/old-missing-target", dest.join("udevadm")).unwrap();
+
+        copy_dir_recursive(&source, &dest).unwrap();
+
+        assert_eq!(
+            fs::read_link(dest.join("udevadm")).unwrap(),
+            Path::new("/missing-target")
+        );
         let _ = fs::remove_dir_all(&temp);
     }
 
