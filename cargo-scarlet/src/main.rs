@@ -275,8 +275,10 @@ struct ImageLock {
 struct SectionLock {
     hash: String,
     #[serde(default)]
+    layers: Vec<LayerLock>,
+    #[serde(default, skip_serializing)]
     files: Vec<FileLock>,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     packages: Vec<PackageLock>,
 }
 
@@ -300,6 +302,33 @@ struct PackageLock {
     #[serde(skip_serializing_if = "Option::is_none")]
     output: Option<String>,
     hash: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+enum LayerLock {
+    Copy {
+        source: String,
+        hash: String,
+    },
+    Cargo {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        source: Option<LockPackageSource>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        git: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        resolved_rev: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        bin: Option<String>,
+        hash: String,
+    },
+    Script {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        source: Option<LockPackageSource>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        output: Option<String>,
+        hash: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -333,6 +362,75 @@ impl PackageLock {
             (None, None) => true,
             _ => false,
         }
+    }
+}
+
+impl SectionLock {
+    fn package_locks(&self) -> impl Iterator<Item = PackageLock> + '_ {
+        self.packages
+            .iter()
+            .cloned()
+            .chain(self.layers.iter().filter_map(|layer| match layer {
+                LayerLock::Cargo {
+                    source,
+                    git,
+                    resolved_rev,
+                    bin,
+                    hash,
+                } => Some(PackageLock {
+                    kind: "cargo".to_string(),
+                    source: source.clone(),
+                    git: git.clone(),
+                    resolved_rev: resolved_rev.clone(),
+                    bin: bin.clone(),
+                    output: None,
+                    hash: hash.clone(),
+                }),
+                LayerLock::Script {
+                    source,
+                    output,
+                    hash,
+                } => Some(PackageLock {
+                    kind: "script".to_string(),
+                    source: source.clone(),
+                    git: None,
+                    resolved_rev: None,
+                    bin: None,
+                    output: output.clone(),
+                    hash: hash.clone(),
+                }),
+                LayerLock::Copy { .. } => None,
+            }))
+    }
+
+    fn copy_locks(&self) -> impl Iterator<Item = FileLock> + '_ {
+        self.files
+            .iter()
+            .cloned()
+            .chain(self.layers.iter().filter_map(|layer| match layer {
+                LayerLock::Copy { source, hash } => Some(FileLock {
+                    source: source.clone(),
+                    hash: hash.clone(),
+                }),
+                _ => None,
+            }))
+    }
+}
+
+fn package_lock_to_layer(lock: PackageLock) -> LayerLock {
+    match lock.kind.as_str() {
+        "script" => LayerLock::Script {
+            source: lock.source,
+            output: lock.output,
+            hash: lock.hash,
+        },
+        _ => LayerLock::Cargo {
+            source: lock.source,
+            git: lock.git,
+            resolved_rev: lock.resolved_rev,
+            bin: lock.bin,
+            hash: lock.hash,
+        },
     }
 }
 
@@ -621,8 +719,7 @@ fn resolve_git_sources(
                     .sections
                     .get(section_name)
                     .and_then(|s| {
-                        s.packages
-                            .iter()
+                        s.package_locks()
                             .find(|p| p.git.as_deref() == Some(&url) && p.bin == pkg.bin)
                     })
                     .and_then(|p| p.resolved_rev.clone());
@@ -1065,6 +1162,7 @@ fn cmd_update(project: &Path) -> Result<(), String> {
             .entry(section_name.clone())
             .or_insert_with(|| SectionLock {
                 hash: String::new(),
+                layers: Vec::new(),
                 files: Vec::new(),
                 packages: Vec::new(),
             });
@@ -1091,16 +1189,17 @@ fn cmd_update(project: &Path) -> Result<(), String> {
                     output: None,
                     hash: String::new(),
                 };
-                if let Some(existing) = section_lock
-                    .packages
-                    .iter_mut()
-                    .find(|p| p.git == git && p.bin == new_pkg.bin)
-                {
-                    existing.resolved_rev = new_pkg.resolved_rev;
-                    existing.source = new_pkg.source;
-                } else {
-                    section_lock.packages.push(new_pkg);
-                }
+                section_lock.layers.retain(|layer| {
+                    !matches!(
+                        layer,
+                        LayerLock::Cargo {
+                            git: layer_git,
+                            bin: layer_bin,
+                            ..
+                        } if *layer_git == git && *layer_bin == new_pkg.bin
+                    )
+                });
+                section_lock.layers.push(package_lock_to_layer(new_pkg));
             }
         }
 
@@ -1108,14 +1207,13 @@ fn cmd_update(project: &Path) -> Result<(), String> {
             if let FileSource::Url(url) = &file.source {
                 eprintln!("cargo-scarlet: fetching {}", url);
                 let (_, hash) = fetch_url_cached(url, &file_cache_dir, None)?;
-                if let Some(existing) = section_lock.files.iter_mut().find(|f| f.source == *url) {
-                    existing.hash = hash;
-                } else {
-                    section_lock.files.push(FileLock {
-                        source: url.clone(),
-                        hash,
-                    });
-                }
+                section_lock.layers.retain(
+                    |layer| !matches!(layer, LayerLock::Copy { source, .. } if source == url),
+                );
+                section_lock.layers.push(LayerLock::Copy {
+                    source: url.clone(),
+                    hash,
+                });
             }
         }
     }
@@ -1552,8 +1650,7 @@ fn build_manifest_image(
 
                 let cache_dir = project.join(".scarlet/cache/files");
                 let prev_section_lock = existing_lock.sections.get(&section_name);
-                let mut file_locks: Vec<FileLock> = Vec::new();
-                let mut package_locks: Vec<PackageLock> = Vec::new();
+                let mut layer_locks: Vec<LayerLock> = Vec::new();
 
                 for layer in &resolved.layers {
                     match layer {
@@ -1564,14 +1661,14 @@ fn build_manifest_image(
                                 &cache_dir,
                                 prev_section_lock,
                                 &tpl_ctx,
-                                &mut file_locks,
+                                &mut layer_locks,
                             )?;
                         }
                         ResolvedLayer::Package(pkg) => {
                             let lock_source = package_lock_source(project, pkg)?;
                             let prev_pkg =
                                 existing_lock.sections.get(&section_name).and_then(|s| {
-                                    s.packages.iter().find(|p| {
+                                    s.package_locks().find(|p| {
                                         p.kind == pkg.kind.as_deref().unwrap_or("")
                                             && p.source_matches(lock_source.as_ref())
                                     })
@@ -1582,9 +1679,9 @@ fn build_manifest_image(
                                 project,
                                 &target_triple,
                                 profile,
-                                prev_pkg,
+                                prev_pkg.as_ref(),
                             )? {
-                                package_locks.push(lock);
+                                layer_locks.push(package_lock_to_layer(lock));
                             }
                         }
                         ResolvedLayer::Image { source, to } => {
@@ -1612,8 +1709,9 @@ fn build_manifest_image(
                         section_name
                     );
                     let mut updated = existing.clone();
-                    updated.packages = package_locks;
-                    updated.files = file_locks;
+                    updated.layers = layer_locks;
+                    updated.packages = Vec::new();
+                    updated.files = Vec::new();
                     new_lock.sections.insert(section_name.clone(), updated);
                     continue;
                 }
@@ -1635,8 +1733,9 @@ fn build_manifest_image(
                     section_name.clone(),
                     SectionLock {
                         hash: staging_hash,
-                        files: file_locks,
-                        packages: package_locks,
+                        layers: layer_locks,
+                        files: Vec::new(),
+                        packages: Vec::new(),
                     },
                 );
             }
@@ -1723,6 +1822,7 @@ fn build_manifest_image(
                     section_name.clone(),
                     SectionLock {
                         hash: limine_hash,
+                        layers: Vec::new(),
                         files: Vec::new(),
                         packages: Vec::new(),
                     },
@@ -1981,19 +2081,15 @@ fn apply_copy_layer(
     cache_dir: &Path,
     prev_section_lock: Option<&SectionLock>,
     tpl_ctx: &TemplateContext,
-    file_locks: &mut Vec<FileLock>,
+    layer_locks: &mut Vec<LayerLock>,
 ) -> Result<(), String> {
     let local_path = match &file.source {
         FileSource::Local(p) => p.clone(),
         FileSource::Url(u) => {
-            let expected = prev_section_lock.and_then(|s| {
-                s.files
-                    .iter()
-                    .find(|f| f.source == *u)
-                    .map(|f| f.hash.as_str())
-            });
-            let (path, hash) = fetch_url_cached(u, cache_dir, expected)?;
-            file_locks.push(FileLock {
+            let expected = prev_section_lock
+                .and_then(|s| s.copy_locks().find(|f| f.source == *u).map(|f| f.hash));
+            let (path, hash) = fetch_url_cached(u, cache_dir, expected.as_deref())?;
+            layer_locks.push(LayerLock::Copy {
                 source: u.clone(),
                 hash,
             });
