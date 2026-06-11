@@ -271,7 +271,7 @@ struct FileLock {
 struct PackageLock {
     kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    source: Option<String>,
+    source: Option<LockPackageSource>,
     #[serde(skip_serializing_if = "Option::is_none")]
     git: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -281,6 +281,40 @@ struct PackageLock {
     #[serde(skip_serializing_if = "Option::is_none")]
     output: Option<String>,
     hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(untagged)]
+enum LockPackageSource {
+    Structured(StructuredPackageSource),
+    LegacyPath(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+enum StructuredPackageSource {
+    Path { path: String },
+    Git { url: String, rev: String },
+}
+
+impl LockPackageSource {
+    fn path(path: String) -> Self {
+        Self::Structured(StructuredPackageSource::Path { path })
+    }
+
+    fn git(url: String, rev: String) -> Self {
+        Self::Structured(StructuredPackageSource::Git { url, rev })
+    }
+}
+
+impl PackageLock {
+    fn source_matches(&self, source: Option<&LockPackageSource>) -> bool {
+        match (&self.source, source) {
+            (Some(locked), Some(source)) => locked == source,
+            (None, None) => true,
+            _ => false,
+        }
+    }
 }
 
 struct ResolvedPackage {
@@ -968,15 +1002,17 @@ fn cmd_update(project: &Path) -> Result<(), String> {
 
         for pkg in &section.packages {
             if pkg.source.as_ref().is_some_and(|s| s.is_git()) {
-                let source = pkg
-                    .local_source
-                    .as_ref()
-                    .map(|p| p.to_string_lossy().to_string());
                 let git = pkg
                     .source
                     .as_ref()
                     .and_then(|s| s.git_url())
                     .map(|s| s.to_string());
+                let source = match (&git, &pkg.resolved_rev) {
+                    (Some(url), Some(rev)) => {
+                        Some(LockPackageSource::git(url.clone(), rev.clone()))
+                    }
+                    _ => package_lock_source(project, pkg)?,
+                };
                 let new_pkg = PackageLock {
                     kind: pkg.kind.clone().unwrap_or_default(),
                     source,
@@ -1513,15 +1549,11 @@ fn build_manifest_image(
                             copy_dir_recursive(&from_staging, &dest)?;
                         }
                     } else {
+                        let lock_source = package_lock_source(project, pkg)?;
                         let prev_pkg = existing_lock.sections.get(&section_name).and_then(|s| {
                             s.packages.iter().find(|p| {
                                 p.kind == pkg.kind.as_deref().unwrap_or("")
-                                    && p.source.as_deref()
-                                        == pkg
-                                            .local_source
-                                            .as_ref()
-                                            .map(|s| s.to_string_lossy().to_string())
-                                            .as_deref()
+                                    && p.source_matches(lock_source.as_ref())
                             })
                         });
                         if let Some(lock) = install_package(
@@ -1917,7 +1949,7 @@ fn fetch_url_cached(
 fn install_package(
     staging_dir: &Path,
     pkg: &ResolvedPackage,
-    _project: &Path,
+    project: &Path,
     target_triple: &str,
     profile: &str,
     prev_lock: Option<&PackageLock>,
@@ -1993,15 +2025,19 @@ fn install_package(
                 .map_err(|e| format!("failed to copy {}: {e}", binary.display()))?;
 
             let hash = sha256_file(&binary)?;
-            let (git_url, resolved_rev) = match &pkg.source {
+            let (source, git_url, resolved_rev) = match &pkg.source {
                 Some(PackageSource::Git { git, .. }) => {
-                    (Some(git.clone()), pkg.resolved_rev.clone())
+                    let resolved_rev = pkg.resolved_rev.clone();
+                    let source = resolved_rev
+                        .as_ref()
+                        .map(|rev| LockPackageSource::git(git.clone(), rev.clone()));
+                    (source, Some(git.clone()), resolved_rev)
                 }
-                _ => (None, None),
+                _ => (package_lock_source(project, pkg)?, None, None),
             };
             Ok(Some(PackageLock {
                 kind: "cargo".to_string(),
-                source: Some(source.to_string_lossy().to_string()),
+                source,
                 git: git_url,
                 resolved_rev,
                 bin: Some(bin_name.to_string()),
@@ -2017,7 +2053,7 @@ fn install_package(
             let script_path = if source.is_absolute() {
                 source.clone()
             } else {
-                _project.join(source)
+                project.join(source)
             };
             if !script_path.exists() {
                 return Err(format!("script not found: {}", script_path.display()));
@@ -2052,7 +2088,7 @@ fn install_package(
                         let status = Command::new("sh")
                             .arg(&script_path)
                             .arg(&script_output)
-                            .current_dir(_project)
+                            .current_dir(project)
                             .status()
                             .map_err(|e| {
                                 format!("failed to run script {}: {e}", script_path.display())
@@ -2065,7 +2101,7 @@ fn install_package(
                     let status = Command::new("sh")
                         .arg(&script_path)
                         .arg(&script_output)
-                        .current_dir(_project)
+                        .current_dir(project)
                         .status()
                         .map_err(|e| {
                             format!("failed to run script {}: {e}", script_path.display())
@@ -2078,7 +2114,7 @@ fn install_package(
                 let status = Command::new("sh")
                     .arg(&script_path)
                     .arg(&script_output)
-                    .current_dir(_project)
+                    .current_dir(project)
                     .status()
                     .map_err(|e| format!("failed to run script {}: {e}", script_path.display()))?;
                 if !status.success() {
@@ -2113,7 +2149,7 @@ fn install_package(
             };
             Ok(Some(PackageLock {
                 kind: "script".to_string(),
-                source: Some(source.to_string_lossy().to_string()),
+                source: package_lock_source(project, pkg)?,
                 git: None,
                 resolved_rev: None,
                 bin: None,
@@ -2307,8 +2343,10 @@ fn cargo_key_to_rust_identifier(name: &str) -> String {
 }
 
 fn pathdiff(path: &Path, base: &Path) -> Result<PathBuf, String> {
-    let path_components = path.components().collect::<Vec<_>>();
-    let base_components = base.components().collect::<Vec<_>>();
+    let normalized_path = normalize_path_lexically(path);
+    let normalized_base = normalize_path_lexically(base);
+    let path_components = normalized_path.components().collect::<Vec<_>>();
+    let base_components = normalized_base.components().collect::<Vec<_>>();
 
     let mut common = 0usize;
     while common < path_components.len()
@@ -2331,6 +2369,50 @@ fn pathdiff(path: &Path, base: &Path) -> Result<PathBuf, String> {
     }
 
     Ok(result)
+}
+
+fn package_lock_source(
+    project: &Path,
+    pkg: &ResolvedPackage,
+) -> Result<Option<LockPackageSource>, String> {
+    match &pkg.source {
+        Some(PackageSource::Path(_)) => {
+            let source = pkg
+                .local_source
+                .as_ref()
+                .ok_or("path package missing local source")?;
+            let relative = pathdiff(source, project)?;
+            Ok(Some(LockPackageSource::path(
+                relative.to_string_lossy().to_string(),
+            )))
+        }
+        Some(PackageSource::Git { git, .. }) => match &pkg.resolved_rev {
+            Some(rev) => Ok(Some(LockPackageSource::git(git.clone(), rev.clone()))),
+            None => Ok(None),
+        },
+        None => Ok(None),
+    }
+}
+
+fn normalize_path_lexically(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !normalized.pop() {
+                    normalized.push(component.as_os_str());
+                }
+            }
+            _ => normalized.push(component.as_os_str()),
+        }
+    }
+
+    if normalized.as_os_str().is_empty() {
+        normalized.push(".");
+    }
+
+    normalized
 }
 
 fn absolutize_from_current_dir(path: &Path) -> Result<PathBuf, String> {
@@ -3124,4 +3206,112 @@ fn which(cmd: &str) -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lock_source_path_serializes_to_table() {
+        let source = LockPackageSource::path("../../user/bin".to_string());
+        let lock = PackageLock {
+            kind: "cargo".to_string(),
+            source: Some(source.clone()),
+            git: None,
+            resolved_rev: None,
+            bin: Some("sh".to_string()),
+            output: None,
+            hash: "sha256:abc".to_string(),
+        };
+        let toml_str = toml::to_string_pretty(&lock).unwrap();
+        assert!(toml_str.contains("type = \"path\""), "expected type tag");
+        assert!(
+            toml_str.contains("../../user/bin"),
+            "expected relative path"
+        );
+        assert!(
+            !toml_str.contains("/Users/"),
+            "should not contain absolute path"
+        );
+
+        // Round-trip
+        let deserialized: PackageLock = toml::from_str(&toml_str).unwrap();
+        assert_eq!(deserialized.source, Some(source));
+    }
+
+    #[test]
+    fn lock_source_git_serializes_to_table() {
+        let source = LockPackageSource::git(
+            "https://github.com/example/repo".to_string(),
+            "abc123".to_string(),
+        );
+        let lock = PackageLock {
+            kind: "cargo".to_string(),
+            source: Some(source.clone()),
+            git: Some("https://github.com/example/repo".to_string()),
+            resolved_rev: Some("abc123".to_string()),
+            bin: Some("tool".to_string()),
+            output: None,
+            hash: "sha256:def".to_string(),
+        };
+        let toml_str = toml::to_string_pretty(&lock).unwrap();
+        assert!(toml_str.contains("type = \"git\""), "expected git type tag");
+        assert!(toml_str.contains("https://github.com/example/repo"));
+
+        let deserialized: PackageLock = toml::from_str(&toml_str).unwrap();
+        assert_eq!(deserialized.source, Some(source));
+    }
+
+    #[test]
+    fn lock_legacy_string_source_deserializes() {
+        let toml_str = r#"
+kind = "cargo"
+source = "/Users/someone/absolute/path"
+bin = "sh"
+hash = "sha256:abc"
+"#;
+        let lock: PackageLock = toml::from_str(toml_str).unwrap();
+        match lock.source {
+            Some(LockPackageSource::LegacyPath(s)) => {
+                assert_eq!(s, "/Users/someone/absolute/path");
+            }
+            other => panic!("expected LegacyPath, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn source_matches_compares_structured() {
+        let a = Some(LockPackageSource::path("../../user/bin".to_string()));
+        let b = Some(LockPackageSource::path("../../user/bin".to_string()));
+        let c = Some(LockPackageSource::path("../../other".to_string()));
+
+        let lock = PackageLock {
+            kind: "cargo".to_string(),
+            source: a,
+            git: None,
+            resolved_rev: None,
+            bin: None,
+            output: None,
+            hash: String::new(),
+        };
+        assert!(lock.source_matches(b.as_ref()));
+        assert!(!lock.source_matches(c.as_ref()));
+        assert!(!lock.source_matches(None));
+    }
+
+    #[test]
+    fn normalize_path_lexically_cleans_dots() {
+        let input = Path::new("/Users/foo/projects/riscv64/../../bundles/base/../../user/bin");
+        let normalized = normalize_path_lexically(input);
+        assert_eq!(normalized, Path::new("/Users/foo/user/bin"));
+    }
+
+    #[test]
+    fn pathdiff_produces_stable_relative() {
+        let project = Path::new("/Users/foo/projects/riscv64-limine-full");
+        let source = Path::new("/Users/foo/user/bin");
+        let relative = pathdiff(source, project).unwrap();
+        assert_eq!(relative, Path::new("../../user/bin"));
+    }
 }
