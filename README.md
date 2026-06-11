@@ -67,21 +67,17 @@ cargo scarlet image --project my-board
 cargo scarlet run --project my-board --release
 ```
 
-## Quick Start: Creating a Module
+## Quick Start: Creating a Loadable Scarlet Module (LSM)
 
 ```bash
-cargo scarlet new --module my-module
+cargo scarlet new --lsm my-module
 ```
 
-This generates a loadable kernel module with `Cargo.toml`, `module.toml`, `build.rs`, and `src/lib.rs`.
+This generates a loadable scarlet module with `Cargo.toml`, `module.toml`, `build.rs`, and `src/lib.rs`.
 
 ```bash
-# Build the module
-cargo scarlet build --module my-module
-
-# Enable it in your project's scarlet.toml
-# [modules]
-# "my-module" = { path = "../my-module", enabled = true }
+# Build the LSM
+cargo scarlet build --lsm my-module --target riscv64gc-unknown-none-elf
 ```
 
 ## Commands
@@ -94,7 +90,7 @@ cargo scarlet image --project <path>              # Build kernel + compose image
 cargo scarlet run --project <path> --release      # Build images and launch runner
 cargo scarlet update --project <path>             # Resolve git/URL sources, write lock
 cargo scarlet new --project <name> --target <triple>  # Scaffold new project
-cargo scarlet new --module <name>                     # Scaffold new module
+cargo scarlet new --lsm <name>                       # Scaffold new loadable scarlet module
 ```
 
 ## Documentation
