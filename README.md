@@ -42,10 +42,13 @@ my-board/
 ├── Cargo.toml
 ├── build.rs
 ├── scarlet.toml
-├── src/main.rs              # Boot entry point (TODO: implement arch_start_kernel)
-├── lds/                     # Linker scripts (TODO: add yours)
-├── .cargo/config.toml       # Cargo build config
-└── .scarlet/scarlet-modules/ # Generated module crate
+├── src/main.rs                           # TODO: implement arch_start_kernel
+├── lds/                                  # TODO: add linker script
+├── .cargo/config.toml                    # TODO: set runner, rustflags
+└── .scarlet/scarlet-modules/
+    ├── Cargo.toml
+    ├── src/lib.rs
+    └── .cargo/config.toml                # TODO: set target, build-std, rustflags
 ```
 
 After scaffolding, you need to:
