@@ -1,6 +1,6 @@
 # scarlet-sdk
 
-Build tools for [Scarlet OS](https://github.com/petitstrawberry/Scarlet).
+Build tools for [Scarlet](https://github.com/petitstrawberry/Scarlet).
 
 ## Installing
 
