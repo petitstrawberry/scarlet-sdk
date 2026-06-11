@@ -50,9 +50,12 @@ my-board/
 
 After scaffolding, you need to:
 
-1. Add a linker script to `lds/`
-2. Implement the boot entry in `src/main.rs` (e.g. call `scarlet::arch::riscv64::boot::limine::limine_entry()`)
-3. Configure `.scarlet/scarlet-modules/.cargo/config.toml` with `target`, `build-std`, and `rustflags`
+1. Edit `.cargo/config.toml` — set runner, rustflags (linker script path), etc.
+2. Edit `.scarlet/scarlet-modules/.cargo/config.toml` — set `build.target`, `unstable.build-std`, and `rustflags` for the module crate
+3. Add a linker script to `lds/`
+4. Implement the boot entry in `src/main.rs` (e.g. call `scarlet::arch::riscv64::boot::limine::limine_entry()`)
+
+Both `.cargo/config.toml` files are generated as commented templates and will not be overwritten on subsequent builds.
 
 Then build and run:
 
