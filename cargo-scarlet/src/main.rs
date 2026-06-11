@@ -196,35 +196,42 @@ struct ManifestImageSection {
     #[serde(default)]
     cmdline: String,
     #[serde(default)]
-    packages: Vec<ManifestPackage>,
-    #[serde(default)]
-    files: Vec<ManifestFileEntry>,
+    layers: Vec<ManifestLayer>,
     #[serde(default)]
     deps: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-struct ManifestPackage {
-    kind: Option<String>,
-    source: Option<PackageSource>,
-    package: Option<String>,
-    bin: Option<String>,
-    from: Option<String>,
-    to: String,
-    output: Option<String>,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-struct ManifestFileEntry {
-    source: String,
-    to: String,
-    #[serde(default)]
-    template: bool,
+#[serde(tag = "kind", rename_all = "kebab-case")]
+enum ManifestLayer {
+    Bundle {
+        path: String,
+    },
+    Copy {
+        source: String,
+        to: String,
+        #[serde(default)]
+        template: bool,
+    },
+    Cargo {
+        source: PackageSource,
+        package: Option<String>,
+        bin: Option<String>,
+        to: String,
+    },
+    Script {
+        source: String,
+        output: Option<String>,
+        to: String,
+    },
+    Image {
+        source: String,
+        to: String,
+    },
 }
 
 struct ResolvedSection {
-    packages: Vec<ResolvedPackage>,
-    files: Vec<ResolvedFile>,
+    layers: Vec<ResolvedLayer>,
 }
 
 struct ExpandedManifest {
@@ -243,7 +250,19 @@ struct PluginRequest<'a> {
     kernel_elf: String,
     initramfs: Option<String>,
     output: String,
-    section: &'a ManifestImageSection,
+    section: PluginRequestSection,
+}
+
+#[derive(Serialize)]
+struct PluginRequestSection {
+    cmdline: Option<String>,
+    packages: Vec<PluginRequestPackage>,
+}
+
+#[derive(Serialize)]
+struct PluginRequestPackage {
+    source: String,
+    to: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
@@ -325,9 +344,47 @@ struct ResolvedPackage {
     package_name: Option<String>,
     bin: Option<String>,
     from: Option<PathBuf>,
-    from_image: Option<String>,
     to: String,
     output: Option<PathBuf>,
+}
+
+struct PackageLayerSpec {
+    kind: String,
+    source: Option<PackageSource>,
+    package: Option<String>,
+    bin: Option<String>,
+    from: Option<String>,
+    to: String,
+    output: Option<String>,
+}
+
+enum ResolvedLayer {
+    Copy(ResolvedFile),
+    Package(ResolvedPackage),
+    Image { source: String, to: String },
+}
+
+impl ResolvedSection {
+    fn packages(&self) -> impl Iterator<Item = &ResolvedPackage> {
+        self.layers.iter().filter_map(|layer| match layer {
+            ResolvedLayer::Package(pkg) => Some(pkg),
+            _ => None,
+        })
+    }
+
+    fn packages_mut(&mut self) -> impl Iterator<Item = &mut ResolvedPackage> {
+        self.layers.iter_mut().filter_map(|layer| match layer {
+            ResolvedLayer::Package(pkg) => Some(pkg),
+            _ => None,
+        })
+    }
+
+    fn copies(&self) -> impl Iterator<Item = &ResolvedFile> {
+        self.layers.iter().filter_map(|layer| match layer {
+            ResolvedLayer::Copy(file) => Some(file),
+            _ => None,
+        })
+    }
 }
 
 fn load_manifest(project_dir: &Path) -> Result<ScarletManifest, String> {
@@ -336,8 +393,6 @@ fn load_manifest(project_dir: &Path) -> Result<ScarletManifest, String> {
         .map_err(|e| format!("failed to read {}: {e}", manifest_path.display()))?;
     let mut root: toml::Value = toml::from_str(&text)
         .map_err(|e| format!("failed to parse {}: {e}", manifest_path.display()))?;
-
-    merge_layers_recursive(&mut root, project_dir)?;
 
     let local_path = project_dir.join("scarlet.local.toml");
     if local_path.exists() {
@@ -354,9 +409,9 @@ fn load_manifest(project_dir: &Path) -> Result<ScarletManifest, String> {
     let manifest: ScarletManifest =
         toml::from_str(&merged_text).map_err(|e| format!("failed to deserialize manifest: {e}"))?;
 
-    if manifest.schema_version != 1 {
+    if manifest.schema_version != 2 {
         return Err(format!(
-            "unsupported schema_version {} (expected 1)",
+            "unsupported schema_version {} (expected 2)",
             manifest.schema_version
         ));
     }
@@ -394,67 +449,8 @@ fn merge_toml_into(parent: &mut toml::Value, child: toml::Value) {
     }
 }
 
-fn resolve_toml_paths(value: &mut toml::Value, origin_dir: &Path) {
-    let toml::Value::Table(table) = value else {
-        return;
-    };
-    for (key, val) in table.iter_mut() {
-        match val {
-            toml::Value::String(s) if key == "source" || key == "path" => {
-                let resolved = resolve_path(origin_dir, s);
-                *s = resolved.to_string_lossy().to_string();
-            }
-            toml::Value::Table(_) => resolve_toml_paths(val, origin_dir),
-            toml::Value::Array(arr) => {
-                for item in arr.iter_mut() {
-                    resolve_toml_paths(item, origin_dir);
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
-fn merge_layers_recursive(value: &mut toml::Value, base_dir: &Path) -> Result<(), String> {
-    let layers = match value {
-        toml::Value::Table(table) => table.remove("layers"),
-        _ => None,
-    };
-
-    if let Some(toml::Value::Array(layers)) = layers {
-        for layer_entry in layers {
-            let toml::Value::Table(layer_tbl) = layer_entry else {
-                continue;
-            };
-            let Some(toml::Value::String(path_str)) = layer_tbl.get("path") else {
-                continue;
-            };
-            let layer_path = resolve_path(base_dir, path_str);
-            let layer_dir = layer_path.parent().unwrap_or(Path::new("."));
-            let layer_text = fs::read_to_string(&layer_path)
-                .map_err(|e| format!("failed to read layer {}: {e}", layer_path.display()))?;
-            let mut layer_value: toml::Value = toml::from_str(&layer_text)
-                .map_err(|e| format!("failed to parse layer {}: {e}", layer_path.display()))?;
-            merge_layers_recursive(&mut layer_value, layer_dir)?;
-            resolve_toml_paths(&mut layer_value, layer_dir);
-            merge_toml_into(value, layer_value);
-        }
-    }
-
-    if let toml::Value::Table(table) = value {
-        for (_key, sub_value) in table.iter_mut() {
-            if let toml::Value::Table(_sub_table) = sub_value {
-                let sub_dir = base_dir.to_path_buf();
-                merge_layers_recursive(sub_value, &sub_dir)?;
-            }
-        }
-    }
-
-    Ok(())
-}
-
 fn resolve_package(
-    pkg: &ManifestPackage,
+    pkg: &PackageLayerSpec,
     base_dir: &Path,
     target_triple: &str,
     images: &BTreeMap<String, ManifestImageSection>,
@@ -479,7 +475,7 @@ fn resolve_package(
     });
     let local_source = source.as_ref().and_then(|s| s.to_local_path(base_dir));
     ResolvedPackage {
-        kind: pkg.kind.clone(),
+        kind: Some(pkg.kind.clone()),
         source,
         local_source,
         resolved_rev: None,
@@ -495,11 +491,6 @@ fn resolve_package(
                 ))
             }
         }),
-        from_image: pkg
-            .from
-            .as_ref()
-            .filter(|s| images.contains_key(s.as_str()))
-            .cloned(),
         to: expand_templates(&pkg.to, target_triple, arch),
         output: pkg.output.as_ref().map(|o| resolve_path(base_dir, o)),
     }
@@ -612,7 +603,7 @@ fn resolve_git_sources(
 ) -> Result<(), String> {
     let cache_dir = project.join(".scarlet/cache/git");
     for (section_name, section) in expanded.sections.iter_mut() {
-        for pkg in &mut section.packages {
+        for pkg in section.packages_mut() {
             if let Some(PackageSource::Git {
                 git,
                 branch,
@@ -699,33 +690,111 @@ struct ResolvedFile {
     template: bool,
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct BundleManifest {
+    #[serde(default)]
+    layers: Vec<ManifestLayer>,
+}
+
 fn resolve_section(
     section: &ManifestImageSection,
     base_dir: &Path,
     ctx: &TemplateContext,
     images: &BTreeMap<String, ManifestImageSection>,
 ) -> Result<ResolvedSection, String> {
-    let mut packages = Vec::new();
-    let mut files = Vec::new();
+    let layers = resolve_layers(&section.layers, base_dir, ctx, images)?;
+    Ok(ResolvedSection { layers })
+}
 
-    for pkg in &section.packages {
-        packages.push(resolve_package(pkg, base_dir, &ctx.target_triple, images));
+fn resolve_layers(
+    layers: &[ManifestLayer],
+    base_dir: &Path,
+    ctx: &TemplateContext,
+    images: &BTreeMap<String, ManifestImageSection>,
+) -> Result<Vec<ResolvedLayer>, String> {
+    let mut resolved = Vec::new();
+    for layer in layers {
+        match layer {
+            ManifestLayer::Bundle { path } => {
+                let bundle_path = resolve_path(base_dir, &ctx.expand(path));
+                let bundle_dir = bundle_path.parent().unwrap_or(Path::new("."));
+                let text = fs::read_to_string(&bundle_path)
+                    .map_err(|e| format!("failed to read bundle {}: {e}", bundle_path.display()))?;
+                let bundle: BundleManifest = toml::from_str(&text).map_err(|e| {
+                    format!("failed to parse bundle {}: {e}", bundle_path.display())
+                })?;
+                resolved.extend(resolve_layers(&bundle.layers, bundle_dir, ctx, images)?);
+            }
+            ManifestLayer::Copy {
+                source,
+                to,
+                template,
+            } => {
+                let expanded_source = ctx.expand(source);
+                let source = if expanded_source.starts_with("https://")
+                    || expanded_source.starts_with("http://")
+                {
+                    FileSource::Url(expanded_source)
+                } else {
+                    FileSource::Local(resolve_path(base_dir, &expanded_source))
+                };
+                resolved.push(ResolvedLayer::Copy(ResolvedFile {
+                    source,
+                    to: ctx.expand(to),
+                    template: *template,
+                }));
+            }
+            ManifestLayer::Cargo {
+                source,
+                package,
+                bin,
+                to,
+            } => {
+                let pkg = PackageLayerSpec {
+                    kind: "cargo".to_string(),
+                    source: Some(source.clone()),
+                    package: package.clone(),
+                    bin: bin.clone(),
+                    from: None,
+                    to: to.clone(),
+                    output: None,
+                };
+                resolved.push(ResolvedLayer::Package(resolve_package(
+                    &pkg,
+                    base_dir,
+                    &ctx.target_triple,
+                    images,
+                )));
+            }
+            ManifestLayer::Script { source, output, to } => {
+                let pkg = PackageLayerSpec {
+                    kind: "script".to_string(),
+                    source: Some(PackageSource::Path(source.clone())),
+                    package: None,
+                    bin: None,
+                    from: None,
+                    to: to.clone(),
+                    output: output.clone(),
+                };
+                resolved.push(ResolvedLayer::Package(resolve_package(
+                    &pkg,
+                    base_dir,
+                    &ctx.target_triple,
+                    images,
+                )));
+            }
+            ManifestLayer::Image { source, to } => {
+                if !images.contains_key(source) {
+                    return Err(format!("image layer references unknown image '{}'", source));
+                }
+                resolved.push(ResolvedLayer::Image {
+                    source: source.clone(),
+                    to: ctx.expand(to),
+                });
+            }
+        }
     }
-
-    for f in &section.files {
-        let source = if f.source.starts_with("https://") || f.source.starts_with("http://") {
-            FileSource::Url(f.source.clone())
-        } else {
-            FileSource::Local(resolve_path(base_dir, &ctx.expand(&f.source)))
-        };
-        files.push(ResolvedFile {
-            source,
-            to: ctx.expand(&f.to),
-            template: f.template,
-        });
-    }
-
-    Ok(ResolvedSection { packages, files })
+    Ok(resolved)
 }
 
 fn expand_manifest(project_dir: &Path) -> Result<ExpandedManifest, String> {
@@ -975,7 +1044,7 @@ fn cmd_update(project: &Path) -> Result<(), String> {
     let mut lock = load_lock(project);
 
     for section in expanded.sections.values_mut() {
-        for pkg in &mut section.packages {
+        for pkg in section.packages_mut() {
             if let Some(ref src) = pkg.source
                 && src.is_git()
             {
@@ -1000,7 +1069,7 @@ fn cmd_update(project: &Path) -> Result<(), String> {
                 packages: Vec::new(),
             });
 
-        for pkg in &section.packages {
+        for pkg in section.packages() {
             if pkg.source.as_ref().is_some_and(|s| s.is_git()) {
                 let git = pkg
                     .source
@@ -1035,7 +1104,7 @@ fn cmd_update(project: &Path) -> Result<(), String> {
             }
         }
 
-        for file in &section.files {
+        for file in section.copies() {
             if let FileSource::Url(url) = &file.source {
                 eprintln!("cargo-scarlet: fetching {}", url);
                 let (_, hash) = fetch_url_cached(url, &file_cache_dir, None)?;
@@ -1484,87 +1553,50 @@ fn build_manifest_image(
                 let cache_dir = project.join(".scarlet/cache/files");
                 let prev_section_lock = existing_lock.sections.get(&section_name);
                 let mut file_locks: Vec<FileLock> = Vec::new();
-
-                for file in &resolved.files {
-                    let local_path = match &file.source {
-                        FileSource::Local(p) => p.clone(),
-                        FileSource::Url(u) => {
-                            let expected = prev_section_lock.and_then(|s| {
-                                s.files
-                                    .iter()
-                                    .find(|f| f.source == *u)
-                                    .map(|f| f.hash.as_str())
-                            });
-                            let (path, hash) = fetch_url_cached(u, &cache_dir, expected)?;
-                            file_locks.push(FileLock {
-                                source: u.clone(),
-                                hash,
-                            });
-                            path
-                        }
-                    };
-
-                    let dest = staging_dir.join(file.to.trim_start_matches('/'));
-                    if local_path.is_dir() {
-                        copy_dir_recursive(&local_path, &dest)?;
-                    } else if file.template {
-                        if let Some(parent) = dest.parent() {
-                            fs::create_dir_all(parent).map_err(|e| {
-                                format!("failed to create {}: {e}", parent.display())
-                            })?;
-                        }
-                        let content = fs::read_to_string(&local_path).map_err(|e| {
-                            format!("failed to read template {}: {e}", local_path.display())
-                        })?;
-                        let expanded = tpl_ctx.expand(&content);
-                        fs::write(&dest, expanded).map_err(|e| {
-                            format!(
-                                "failed to write template {} -> {}: {e}",
-                                local_path.display(),
-                                dest.display()
-                            )
-                        })?;
-                    } else {
-                        if let Some(parent) = dest.parent() {
-                            fs::create_dir_all(parent).map_err(|e| {
-                                format!("failed to create {}: {e}", parent.display())
-                            })?;
-                        }
-                        fs::copy(&local_path, &dest).map_err(|e| {
-                            format!(
-                                "failed to copy {} -> {}: {e}",
-                                local_path.display(),
-                                dest.display()
-                            )
-                        })?;
-                    }
-                }
-
                 let mut package_locks: Vec<PackageLock> = Vec::new();
-                for pkg in &resolved.packages {
-                    if let Some(ref img_name) = pkg.from_image {
-                        let from_staging = project.join(format!(".scarlet/staging/{}", img_name));
-                        let dest = staging_dir.join(pkg.to.trim_start_matches('/'));
-                        if from_staging.is_dir() {
-                            copy_dir_recursive(&from_staging, &dest)?;
+
+                for layer in &resolved.layers {
+                    match layer {
+                        ResolvedLayer::Copy(file) => {
+                            apply_copy_layer(
+                                file,
+                                &staging_dir,
+                                &cache_dir,
+                                prev_section_lock,
+                                &tpl_ctx,
+                                &mut file_locks,
+                            )?;
                         }
-                    } else {
-                        let lock_source = package_lock_source(project, pkg)?;
-                        let prev_pkg = existing_lock.sections.get(&section_name).and_then(|s| {
-                            s.packages.iter().find(|p| {
-                                p.kind == pkg.kind.as_deref().unwrap_or("")
-                                    && p.source_matches(lock_source.as_ref())
-                            })
-                        });
-                        if let Some(lock) = install_package(
-                            &staging_dir,
-                            pkg,
-                            project,
-                            &target_triple,
-                            profile,
-                            prev_pkg,
-                        )? {
-                            package_locks.push(lock);
+                        ResolvedLayer::Package(pkg) => {
+                            let lock_source = package_lock_source(project, pkg)?;
+                            let prev_pkg =
+                                existing_lock.sections.get(&section_name).and_then(|s| {
+                                    s.packages.iter().find(|p| {
+                                        p.kind == pkg.kind.as_deref().unwrap_or("")
+                                            && p.source_matches(lock_source.as_ref())
+                                    })
+                                });
+                            if let Some(lock) = install_package(
+                                &staging_dir,
+                                pkg,
+                                project,
+                                &target_triple,
+                                profile,
+                                prev_pkg,
+                            )? {
+                                package_locks.push(lock);
+                            }
+                        }
+                        ResolvedLayer::Image { source, to } => {
+                            let from_staging = project.join(format!(".scarlet/staging/{}", source));
+                            let dest = staging_dir.join(to.trim_start_matches('/'));
+                            if from_staging.is_dir() {
+                                copy_dir_recursive(&from_staging, &dest)?;
+                            } else {
+                                let image_path =
+                                    image_output_path(project, &expanded.manifest.images, source)?;
+                                copy_path_or_dir(&image_path, &dest)?;
+                            }
                         }
                     }
                 }
@@ -1615,19 +1647,9 @@ fn build_manifest_image(
                     _ => &target_triple,
                 };
 
-                let mut initramfs_path = project.join(".scarlet/images/initramfs.cpio");
-                for pkg in &resolved.packages {
-                    if let Some(source) = &pkg.local_source {
-                        let source_name = source
-                            .file_name()
-                            .unwrap_or_default()
-                            .to_string_lossy()
-                            .to_string();
-                        if source_name.contains("initramfs") || source_name.ends_with(".cpio") {
-                            initramfs_path = source.clone();
-                        }
-                    }
-                }
+                let initramfs_path =
+                    initramfs_path_from_layers(project, &expanded.manifest.images, resolved)
+                        .unwrap_or_else(|| project.join(".scarlet/images/initramfs.cpio"));
 
                 let mut limine_hasher = Sha256::new();
                 limine_hasher.update(b"format=limine-uefi\n");
@@ -1680,7 +1702,14 @@ fn build_manifest_image(
                     kernel_elf: kernel_elf.display().to_string(),
                     initramfs: Some(initramfs_path.display().to_string()),
                     output: output_path.display().to_string(),
-                    section: section_cfg,
+                    section: PluginRequestSection {
+                        cmdline: Some(section_cfg.cmdline.clone()),
+                        packages: plugin_packages_from_layers(
+                            project,
+                            &expanded.manifest.images,
+                            resolved,
+                        )?,
+                    },
                 };
                 run_plugin("limine", &request)?;
 
@@ -1944,6 +1973,135 @@ fn fetch_url_cached(
     }
 
     Ok((cached_path, actual_hash))
+}
+
+fn apply_copy_layer(
+    file: &ResolvedFile,
+    staging_dir: &Path,
+    cache_dir: &Path,
+    prev_section_lock: Option<&SectionLock>,
+    tpl_ctx: &TemplateContext,
+    file_locks: &mut Vec<FileLock>,
+) -> Result<(), String> {
+    let local_path = match &file.source {
+        FileSource::Local(p) => p.clone(),
+        FileSource::Url(u) => {
+            let expected = prev_section_lock.and_then(|s| {
+                s.files
+                    .iter()
+                    .find(|f| f.source == *u)
+                    .map(|f| f.hash.as_str())
+            });
+            let (path, hash) = fetch_url_cached(u, cache_dir, expected)?;
+            file_locks.push(FileLock {
+                source: u.clone(),
+                hash,
+            });
+            path
+        }
+    };
+
+    let dest = staging_dir.join(file.to.trim_start_matches('/'));
+    if local_path.is_dir() {
+        copy_dir_recursive(&local_path, &dest)?;
+    } else if file.template {
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+        }
+        let content = fs::read_to_string(&local_path)
+            .map_err(|e| format!("failed to read template {}: {e}", local_path.display()))?;
+        let expanded = tpl_ctx.expand(&content);
+        fs::write(&dest, expanded).map_err(|e| {
+            format!(
+                "failed to write template {} -> {}: {e}",
+                local_path.display(),
+                dest.display()
+            )
+        })?;
+    } else {
+        copy_path_or_dir(&local_path, &dest)?;
+    }
+
+    Ok(())
+}
+
+fn image_output_path(
+    project: &Path,
+    images: &BTreeMap<String, ManifestImageSection>,
+    image_name: &str,
+) -> Result<PathBuf, String> {
+    let image = images
+        .get(image_name)
+        .ok_or_else(|| format!("unknown image '{}'", image_name))?;
+    let output = image.output.as_deref().unwrap_or(".scarlet/images/output");
+    Ok(project.join(output))
+}
+
+fn initramfs_path_from_layers(
+    project: &Path,
+    images: &BTreeMap<String, ManifestImageSection>,
+    section: &ResolvedSection,
+) -> Option<PathBuf> {
+    section.layers.iter().find_map(|layer| match layer {
+        ResolvedLayer::Copy(file) if file.to == "/boot/initramfs" => match &file.source {
+            FileSource::Local(path) => Some(path.clone()),
+            FileSource::Url(_) => None,
+        },
+        ResolvedLayer::Image { source, to } if to == "/boot/initramfs" => {
+            image_output_path(project, images, source).ok()
+        }
+        _ => None,
+    })
+}
+
+fn plugin_packages_from_layers(
+    project: &Path,
+    images: &BTreeMap<String, ManifestImageSection>,
+    section: &ResolvedSection,
+) -> Result<Vec<PluginRequestPackage>, String> {
+    let mut packages = Vec::new();
+    for layer in &section.layers {
+        match layer {
+            ResolvedLayer::Copy(file) => {
+                if let FileSource::Local(source) = &file.source {
+                    packages.push(PluginRequestPackage {
+                        source: source.display().to_string(),
+                        to: file.to.clone(),
+                    });
+                }
+            }
+            ResolvedLayer::Image { source, to } => {
+                packages.push(PluginRequestPackage {
+                    source: image_output_path(project, images, source)?
+                        .display()
+                        .to_string(),
+                    to: to.clone(),
+                });
+            }
+            ResolvedLayer::Package(_) => {}
+        }
+    }
+    Ok(packages)
+}
+
+fn copy_path_or_dir(source: &Path, dest: &Path) -> Result<(), String> {
+    if source.is_dir() {
+        copy_dir_recursive(source, dest)
+    } else {
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+        }
+        fs::copy(source, dest).map_err(|e| {
+            format!(
+                "failed to copy {} -> {}: {e}",
+                source.display(),
+                dest.display()
+            )
+        })?;
+        Ok(())
+    }
 }
 
 fn install_package(
@@ -3072,7 +3230,7 @@ scarlet_modules = {{ package = "scarlet-modules", path = ".scarlet/scarlet-modul
     write_if_changed(&project_dir.join("Cargo.toml"), &project_cargo_toml)?;
 
     let scarlet_manifest = format!(
-        r#"schema_version = 1
+        r#"schema_version = 2
 
 [project]
 name = "{name}"
@@ -3313,5 +3471,58 @@ hash = "sha256:abc"
         let source = Path::new("/Users/foo/user/bin");
         let relative = pathdiff(source, project).unwrap();
         assert_eq!(relative, Path::new("../../user/bin"));
+    }
+
+    #[test]
+    fn bundle_layer_expands_in_place() {
+        let temp = std::env::temp_dir().join(format!("cargo-scarlet-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp);
+        fs::create_dir_all(temp.join("bundle")).unwrap();
+        fs::write(
+            temp.join("bundle/bundle.toml"),
+            r#"
+[[layers]]
+kind = "copy"
+source = "fs"
+to = "/"
+"#,
+        )
+        .unwrap();
+
+        let layers = vec![
+            ManifestLayer::Bundle {
+                path: "bundle/bundle.toml".to_string(),
+            },
+            ManifestLayer::Copy {
+                source: "rootfs".to_string(),
+                to: "/".to_string(),
+                template: false,
+            },
+        ];
+        let ctx = TemplateContext {
+            arch: "aarch64".to_string(),
+            target_triple: "aarch64-unknown-none-elf".to_string(),
+            project: "test".to_string(),
+        };
+        let images = BTreeMap::new();
+
+        let resolved = resolve_layers(&layers, &temp, &ctx, &images).unwrap();
+        assert_eq!(resolved.len(), 2);
+        match &resolved[0] {
+            ResolvedLayer::Copy(file) => match &file.source {
+                FileSource::Local(path) => assert_eq!(path, &temp.join("bundle/fs")),
+                other => panic!("expected local source, got {other:?}"),
+            },
+            _ => panic!("expected first layer to be bundle copy"),
+        }
+        match &resolved[1] {
+            ResolvedLayer::Copy(file) => match &file.source {
+                FileSource::Local(path) => assert_eq!(path, &temp.join("rootfs")),
+                other => panic!("expected local source, got {other:?}"),
+            },
+            _ => panic!("expected second layer to be project copy"),
+        }
+
+        fs::remove_dir_all(&temp).unwrap();
     }
 }
