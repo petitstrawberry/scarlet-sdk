@@ -2221,13 +2221,13 @@ fn apply_copy_layer(
     };
 
     let dest = staging_dir.join(file.to.trim_start_matches('/'));
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+    }
     if local_path.is_dir() {
         copy_dir_recursive(&local_path, &dest)?;
     } else if file.template {
-        if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
-        }
         let content = fs::read_to_string(&local_path)
             .map_err(|e| format!("failed to read template {}: {e}", local_path.display()))?;
         let expanded = tpl_ctx.expand(&content);
@@ -3720,6 +3720,37 @@ hash = "sha256:abc"
 
         file.template = true;
         assert!(!copy_lock_matches_input(&lock, &file));
+    }
+
+    #[test]
+    fn copy_layer_creates_intermediate_directories() {
+        let temp = std::env::temp_dir().join(format!(
+            "cargo-scarlet-copy-layer-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&temp);
+        let source = temp.join("source");
+        let staging = temp.join("staging");
+        let cache = temp.join("cache");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&staging).unwrap();
+
+        let file = ResolvedFile {
+            source: FileSource::Local(source),
+            to: "/data/config/system/linux-aarch64".to_string(),
+            template: true,
+        };
+        let tpl_ctx = TemplateContext {
+            arch: "aarch64".to_string(),
+            target_triple: "aarch64-unknown-none-elf".to_string(),
+            project: "test".to_string(),
+        };
+        let mut layer_locks = Vec::new();
+
+        apply_copy_layer(&file, &staging, &cache, None, &tpl_ctx, &mut layer_locks).unwrap();
+
+        assert!(staging.join("data/config/system/linux-aarch64").is_dir());
+        let _ = fs::remove_dir_all(&temp);
     }
 
     #[test]
