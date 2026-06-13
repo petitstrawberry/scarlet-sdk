@@ -764,6 +764,18 @@ fn git_cache_dir_for_url(url: &str, cache_base: &Path) -> PathBuf {
     cache_base.join(&hash[..16])
 }
 
+fn package_cargo_target_dir(project: &Path, source: &Path) -> PathBuf {
+    let source_key = source
+        .canonicalize()
+        .unwrap_or_else(|_| source.to_path_buf())
+        .to_string_lossy()
+        .into_owned();
+    let mut hasher = Sha256::new();
+    hasher.update(source_key.as_bytes());
+    let hash = hex::encode(hasher.finalize());
+    project.join(".scarlet/cache/target").join(&hash[..16])
+}
+
 fn git_ensure_checkout(url: &str, rev: &str, cache_base: &Path) -> Result<PathBuf, String> {
     let dir = git_cache_dir_for_url(url, cache_base);
     if dir.join(".git").exists() {
@@ -2361,6 +2373,7 @@ fn install_package(
             } else {
                 "debug"
             };
+            let target_dir = package_cargo_target_dir(project, source);
 
             let binary = {
                 eprintln!(
@@ -2376,6 +2389,7 @@ fn install_package(
                     .arg(source.join("Cargo.toml"))
                     .arg("--target")
                     .arg(&userspace_triple);
+                cmd.env("CARGO_TARGET_DIR", &target_dir);
 
                 if let Some(bin) = pkg.bin.as_deref() {
                     cmd.arg("--bin").arg(bin);
@@ -2393,8 +2407,7 @@ fn install_package(
                     ));
                 }
 
-                let built = source
-                    .join("target")
+                let built = target_dir
                     .join(&userspace_triple)
                     .join(profile_dir)
                     .join(bin_name);
