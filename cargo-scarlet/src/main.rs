@@ -764,16 +764,8 @@ fn git_cache_dir_for_url(url: &str, cache_base: &Path) -> PathBuf {
     cache_base.join(&hash[..16])
 }
 
-fn package_cargo_target_dir(project: &Path, source: &Path) -> PathBuf {
-    let source_key = source
-        .canonicalize()
-        .unwrap_or_else(|_| source.to_path_buf())
-        .to_string_lossy()
-        .into_owned();
-    let mut hasher = Sha256::new();
-    hasher.update(source_key.as_bytes());
-    let hash = hex::encode(hasher.finalize());
-    project.join(".scarlet/cache/target").join(&hash[..16])
+fn project_cargo_target_dir(project: &Path) -> PathBuf {
+    project.join(".scarlet/cache/target")
 }
 
 fn git_ensure_checkout(url: &str, rev: &str, cache_base: &Path) -> Result<PathBuf, String> {
@@ -2373,7 +2365,7 @@ fn install_package(
             } else {
                 "debug"
             };
-            let target_dir = package_cargo_target_dir(project, source);
+            let target_dir = project_cargo_target_dir(project);
 
             let binary = {
                 eprintln!(
