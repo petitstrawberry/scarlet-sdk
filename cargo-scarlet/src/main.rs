@@ -112,6 +112,9 @@ struct ModuleConfig {
 #[serde(untagged)]
 enum PackageSource {
     Path(String),
+    PathTable {
+        path: String,
+    },
     Git {
         git: String,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -127,6 +130,7 @@ impl PackageSource {
     fn to_local_path(&self, base_dir: &Path) -> Option<PathBuf> {
         match self {
             PackageSource::Path(p) => Some(resolve_path(base_dir, p)),
+            PackageSource::PathTable { path } => Some(resolve_path(base_dir, path)),
             PackageSource::Git { .. } => None,
         }
     }
@@ -159,7 +163,10 @@ struct ScarletManifest {
     schema_version: u32,
     #[allow(dead_code)]
     project: ManifestProject,
-    kernel: ManifestKernel,
+    #[serde(default)]
+    bsp: Option<ManifestBsp>,
+    #[serde(default)]
+    kernel: Option<ManifestKernel>,
     #[serde(default)]
     modules: BTreeMap<String, ModuleConfig>,
     #[serde(default)]
@@ -180,13 +187,34 @@ struct ManifestProject {
 }
 
 #[derive(Debug, Deserialize)]
+struct ManifestBsp {
+    path: String,
+    package: String,
+    kernel: ManifestBspKernel,
+}
+
+#[derive(Debug, Deserialize)]
+struct ManifestBspKernel {
+    source: PackageSource,
+    #[serde(default)]
+    features: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct ManifestKernel {
     package: String,
     source: PackageSource,
-    target: String,
     target_json: String,
     #[serde(default)]
     features: BTreeMap<String, bool>,
+}
+
+struct BspConfig<'a> {
+    root: PathBuf,
+    package: &'a str,
+    kernel_source: &'a PackageSource,
+    kernel_features: Vec<String>,
+    build_target: String,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -687,6 +715,10 @@ fn resolve_package(
             let expanded = expand_templates(p, target_triple, arch);
             PackageSource::Path(expanded)
         }
+        PackageSource::PathTable { path } => {
+            let expanded = expand_templates(path, target_triple, arch);
+            PackageSource::PathTable { path: expanded }
+        }
         PackageSource::Git {
             git,
             branch,
@@ -728,6 +760,72 @@ fn resolve_path(base: &Path, relative: &str) -> PathBuf {
         path.to_path_buf()
     } else {
         base.join(path)
+    }
+}
+
+fn manifest_bsp_config<'a>(
+    manifest: &'a ScarletManifest,
+    project_dir: &Path,
+) -> Result<BspConfig<'a>, String> {
+    if let Some(bsp) = &manifest.bsp {
+        let root = resolve_path(project_dir, &bsp.path);
+        let build_target = read_bsp_build_target(&root)?;
+        return Ok(BspConfig {
+            root,
+            package: &bsp.package,
+            kernel_source: &bsp.kernel.source,
+            kernel_features: bsp.kernel.features.clone(),
+            build_target,
+        });
+    }
+
+    let kernel = manifest
+        .kernel
+        .as_ref()
+        .ok_or("scarlet.toml must contain [bsp] or legacy [kernel]")?;
+    Ok(BspConfig {
+        root: project_dir.to_path_buf(),
+        package: &kernel.package,
+        kernel_source: &kernel.source,
+        kernel_features: enabled_feature_names(&kernel.features),
+        build_target: kernel.target_json.clone(),
+    })
+}
+
+fn read_bsp_build_target(bsp_root: &Path) -> Result<String, String> {
+    let config_path = bsp_root.join(".cargo/config.toml");
+    let config = fs::read_to_string(&config_path)
+        .map_err(|e| format!("failed to read {}: {e}", config_path.display()))?;
+    let value: toml::Value = toml::from_str(&config)
+        .map_err(|e| format!("failed to parse {}: {e}", config_path.display()))?;
+    value
+        .get("build")
+        .and_then(|build| build.get("target"))
+        .and_then(toml::Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| format!("{} must define [build].target", config_path.display()))
+}
+
+fn enabled_feature_names(features: &BTreeMap<String, bool>) -> Vec<String> {
+    features
+        .iter()
+        .filter_map(|(feature, enabled)| enabled.then(|| feature.clone()))
+        .collect()
+}
+
+fn target_triple_from_build_target(build_target: &str) -> Result<String, String> {
+    Path::new(build_target)
+        .file_stem()
+        .ok_or_else(|| format!("target path has no file stem: {build_target}"))
+        .map(|stem| stem.to_string_lossy().to_string())
+}
+
+fn build_target_arg(bsp_root: &Path, build_target: &str) -> String {
+    let path = Path::new(build_target);
+    if path.is_absolute() {
+        build_target.to_string()
+    } else {
+        bsp_root.join(path).display().to_string()
     }
 }
 
@@ -1028,7 +1126,8 @@ fn resolve_layers(
 
 fn expand_manifest(project_dir: &Path) -> Result<ExpandedManifest, String> {
     let manifest = load_manifest(project_dir)?;
-    let target_triple = manifest.kernel.target.clone();
+    let bsp = manifest_bsp_config(&manifest, project_dir)?;
+    let target_triple = target_triple_from_build_target(&bsp.build_target)?;
     let raw_arch = target_triple.split('-').next().unwrap_or("unknown");
     let arch = match raw_arch {
         "riscv64gc" => "riscv64".to_string(),
@@ -1089,6 +1188,7 @@ fn render_manifest_cargo_toml(
     manifest: &ScarletManifest,
     project_dir: &Path,
 ) -> Result<String, String> {
+    let bsp = manifest_bsp_config(manifest, project_dir)?;
     let mut out = String::new();
     let _ = writeln!(&mut out, "# generated by cargo-scarlet");
     out.push_str("[package]\n");
@@ -1098,10 +1198,11 @@ fn render_manifest_cargo_toml(
     out.push_str("[lib]\npath = \"src/lib.rs\"\n\n");
     out.push_str("[dependencies]\n");
 
-    let features = render_enabled_kernel_features(&manifest.kernel.features);
-    let kernel_dep = match &manifest.kernel.source {
-        PackageSource::Path(p) => {
-            let expanded = expand_templates(p, &manifest.kernel.target, "");
+    let features = render_kernel_features(&bsp.kernel_features);
+    let target_triple = target_triple_from_build_target(&bsp.build_target)?;
+    let kernel_dep = match bsp.kernel_source {
+        PackageSource::Path(p) | PackageSource::PathTable { path: p } => {
+            let expanded = expand_templates(p, &target_triple, "");
             let kernel_abs = resolve_path(project_dir, &expanded);
             let generated_root = project_dir.join(".scarlet/scarlet-modules");
             let kernel_rel = pathdiff(&kernel_abs, &generated_root)?;
@@ -1132,7 +1233,7 @@ fn render_manifest_cargo_toml(
             format!("{{ {} }}", parts.join(", "))
         }
     };
-    let _ = writeln!(&mut out, "{} = {}", manifest.kernel.package, kernel_dep);
+    let _ = writeln!(&mut out, "{} = {}", bsp.package, kernel_dep);
 
     for (name, module) in &manifest.modules {
         if !module.enabled {
@@ -1503,29 +1604,31 @@ fn cargo_build_manifest(
     subcommand: &str,
     extra_args: &[String],
 ) -> Result<(), String> {
+    let bsp = manifest_bsp_config(&expanded.manifest, project)?;
     let resolved_target = target
         .map(str::to_string)
-        .unwrap_or_else(|| expanded.manifest.kernel.target_json.clone());
+        .unwrap_or_else(|| bsp.build_target.clone());
+    let target_arg = build_target_arg(&bsp.root, &resolved_target);
 
-    metadata_check(project, &resolved_target)?;
+    metadata_check(&bsp.root, &target_arg)?;
 
     let mut command = Command::new("cargo");
     command.arg(subcommand);
     if release {
         command.arg("--release");
     }
-    command.arg("--target").arg(&resolved_target);
+    command.arg("--target").arg(&target_arg);
 
     if subcommand == "clippy" && !extra_args.iter().any(|arg| arg == "--") {
         command.arg("--").arg("-D").arg("warnings");
     }
 
     command.args(extra_args);
-    command.current_dir(project);
+    command.current_dir(&bsp.root);
 
     eprintln!(
         "cargo-scarlet: running in {} -> cargo {}",
-        project.display(),
+        bsp.root.display(),
         command
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
@@ -1550,23 +1653,16 @@ fn inject_ksym_section_manifest(
     target: Option<&str>,
     release: bool,
 ) -> Result<(), String> {
+    let bsp = manifest_bsp_config(&expanded.manifest, project)?;
     let resolved_target = match target {
         Some(t) => t.to_string(),
-        None => expanded.manifest.kernel.target_json.clone(),
+        None => bsp.build_target.clone(),
     };
-    let target_path = if Path::new(&resolved_target).is_absolute() {
-        PathBuf::from(&resolved_target)
-    } else {
-        project.join(&resolved_target)
-    };
-    let target_triple = target_path
-        .file_stem()
-        .ok_or("target path has no file stem")?
-        .to_string_lossy()
-        .to_string();
+    let target_triple = target_triple_from_build_target(&resolved_target)?;
 
     let profile = if release { "release" } else { "debug" };
-    let binary_path = project
+    let binary_path = bsp
+        .root
         .join("target")
         .join(&target_triple)
         .join(profile)
@@ -1682,19 +1778,12 @@ fn build_manifest_image(
     let kernel_elf = match kernel_elf {
         Some(path) => absolutize_from_current_dir(&path)?,
         None => {
-            let target_json = &expanded.manifest.kernel.target_json;
-            let target_path = if Path::new(target_json).is_absolute() {
-                PathBuf::from(target_json)
-            } else {
-                project.join(target_json)
-            };
-            let target_triple = target_path
-                .file_stem()
-                .ok_or("target path has no file stem")?
-                .to_string_lossy()
-                .to_string();
+            let bsp = manifest_bsp_config(&expanded.manifest, project)?;
+            let build_target = target.as_deref().unwrap_or(&bsp.build_target);
+            let target_triple = target_triple_from_build_target(build_target)?;
             let profile = if release { "release" } else { "debug" };
-            let path = project
+            let path = bsp
+                .root
                 .join("target")
                 .join(&target_triple)
                 .join(profile)
@@ -1710,17 +1799,9 @@ fn build_manifest_image(
     fs::create_dir_all(&images_dir)
         .map_err(|e| format!("failed to create {}: {e}", images_dir.display()))?;
 
-    let target_json = &expanded.manifest.kernel.target_json;
-    let target_path = if Path::new(target_json).is_absolute() {
-        PathBuf::from(target_json)
-    } else {
-        project.join(target_json)
-    };
-    let target_triple = target_path
-        .file_stem()
-        .ok_or("target path has no file stem")?
-        .to_string_lossy()
-        .to_string();
+    let bsp = manifest_bsp_config(&expanded.manifest, project)?;
+    let build_target = target.as_deref().unwrap_or(&bsp.build_target);
+    let target_triple = target_triple_from_build_target(build_target)?;
     let profile = if release { "release" } else { "debug" };
 
     let raw_arch = target_triple.split('-').next().unwrap_or("unknown");
@@ -2636,11 +2717,10 @@ fn normalize_project_path(path: &Path) -> Result<PathBuf, String> {
     fs::canonicalize(path).map_err(|error| format!("failed to resolve {}: {error}", path.display()))
 }
 
-fn render_enabled_kernel_features(features: &BTreeMap<String, bool>) -> String {
+fn render_kernel_features(features: &[String]) -> String {
     features
         .iter()
-        .filter(|(_, enabled)| **enabled)
-        .map(|(name, _)| format!("\"{name}\""))
+        .map(|name| format!("\"{name}\""))
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -2772,7 +2852,7 @@ fn package_lock_source(
     pkg: &ResolvedPackage,
 ) -> Result<Option<LockPackageSource>, String> {
     match &pkg.source {
-        Some(PackageSource::Path(_)) => {
+        Some(PackageSource::Path(_) | PackageSource::PathTable { .. }) => {
             let source = pkg
                 .local_source
                 .as_ref()
