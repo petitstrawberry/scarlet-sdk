@@ -2976,6 +2976,19 @@ fn write_newc_tree(output: &mut fs::File, root: &Path, path: &Path) -> Result<()
         if metadata.is_dir() {
             write_newc_entry(output, name, 0o040000 | unix_mode(&metadata), &[])?;
             write_newc_tree(output, root, &entry_path)?;
+        } else if metadata.file_type().is_symlink() {
+            let target = fs::read_link(&entry_path).map_err(|error| {
+                format!("failed to read symlink {}: {error}", entry_path.display())
+            })?;
+            let target = target
+                .to_str()
+                .ok_or_else(|| format!("non-UTF-8 symlink target: {}", target.display()))?;
+            write_newc_entry(
+                output,
+                name,
+                0o120000 | unix_mode(&metadata),
+                target.as_bytes(),
+            )?;
         } else if metadata.is_file() {
             let mut contents = Vec::new();
             fs::File::open(&entry_path)
@@ -3864,6 +3877,40 @@ hash = "sha256:abc"
             fs::read_link(dest.join("udevadm")).unwrap(),
             Path::new("/missing-target")
         );
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn newc_writer_preserves_symlinks() {
+        let temp = std::env::temp_dir().join(format!(
+            "cargo-scarlet-newc-symlink-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&temp);
+        let staging = temp.join("staging");
+        fs::create_dir_all(staging.join("bin")).unwrap();
+        std::os::unix::fs::symlink("busybox", staging.join("bin/sh")).unwrap();
+        let output = temp.join("initramfs.cpio");
+
+        build_initramfs_newc_from_staging(&staging, &output).unwrap();
+        let archive = fs::read(&output).unwrap();
+        let name = b"bin/sh\0";
+        let name_pos = archive
+            .windows(name.len())
+            .position(|window| window == name)
+            .expect("symlink path missing from archive");
+        let header_start = name_pos - 110;
+        let header = core::str::from_utf8(&archive[header_start..header_start + 110]).unwrap();
+
+        let mode = u32::from_str_radix(&header[14..22], 16).unwrap();
+        assert_eq!(mode & 0o170000, 0o120000);
+        assert_eq!(&header[54..62], "00000007");
+        assert!(
+            archive
+                .windows(b"busybox".len())
+                .any(|window| window == b"busybox")
+        );
+
         let _ = fs::remove_dir_all(&temp);
     }
 
