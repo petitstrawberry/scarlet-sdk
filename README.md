@@ -25,6 +25,15 @@ cargo install --path cargo-scarlet-plugin-limine
 | `cargo-scarlet` | `cargo-scarlet` | Build system CLI — reads `scarlet.toml`, builds kernel, composes images |
 | `cargo-scarlet-plugin-limine` | `cargo-scarlet-plugin-limine` | Limine UEFI boot image plugin |
 
+## Host Dependencies
+
+Image generation uses external filesystem and disk-image tools:
+
+- `mke2fs`, `truncate`, `du` for `format = "ext2"` and `format = "gpt-ext2"`
+- `mformat`, `mmd`, and `mcopy` for `format = "limine-uefi"`
+
+Use `format = "ext2"` for a raw ext2 filesystem image, or `format = "gpt-ext2"` for a GPT disk image with the ext2 root filesystem in partition 1. `gpt-ext2` writes the partition table through the Rust `gpt` crate. A GPT root image is mounted by Scarlet as a partition device such as `root=/dev/vblk1p1`.
+
 ## Quick Start: Creating a Project
 
 ```bash

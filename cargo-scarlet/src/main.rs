@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 
@@ -626,6 +626,7 @@ struct PackageLayerSpec {
     output: Option<String>,
 }
 
+#[allow(clippy::large_enum_variant)]
 enum ResolvedLayer {
     Copy(ResolvedFile),
     Package(ResolvedPackage),
@@ -809,7 +810,8 @@ fn read_bsp_build_target(bsp_root: &Path) -> Result<String, String> {
 fn enabled_feature_names(features: &BTreeMap<String, bool>) -> Vec<String> {
     features
         .iter()
-        .filter_map(|(feature, enabled)| enabled.then(|| feature.clone()))
+        .filter(|(_, enabled)| **enabled)
+        .map(|(feature, _)| feature.clone())
         .collect()
 }
 
@@ -1845,7 +1847,7 @@ fn build_manifest_image(
         eprintln!("cargo-scarlet: staging {}...", section_name);
 
         match format {
-            "newc" | "ext2" => {
+            "newc" | "ext2" | "gpt-ext2" => {
                 if staging_dir.exists() {
                     fs::remove_dir_all(&staging_dir)
                         .map_err(|e| format!("failed to clean staging: {e}"))?;
@@ -1902,10 +1904,11 @@ fn build_manifest_image(
                 }
 
                 let staging_hash = sha256_dir(&staging_dir)?;
+                let image_hash = image_content_hash(format, &staging_hash);
 
                 if output_path.exists()
                     && let Some(existing) = existing_lock.sections.get(&section_name)
-                    && existing.hash == staging_hash
+                    && existing.hash == image_hash
                 {
                     eprintln!(
                         "cargo-scarlet: {} unchanged, skipping image generation",
@@ -1921,21 +1924,28 @@ fn build_manifest_image(
 
                 eprintln!("cargo-scarlet: generating {} image...", section_name);
 
-                if format == "newc" {
-                    build_initramfs_newc_from_staging(&staging_dir, &output_path)?;
-                    eprintln!(
-                        "cargo-scarlet: wrote {} to {}",
-                        section_name,
-                        output_path.display()
-                    );
-                } else {
-                    build_ext2_from_staging(&staging_dir, &output_path, &section_name)?;
+                match format {
+                    "newc" => {
+                        build_initramfs_newc_from_staging(&staging_dir, &output_path)?;
+                        eprintln!(
+                            "cargo-scarlet: wrote {} to {}",
+                            section_name,
+                            output_path.display()
+                        );
+                    }
+                    "ext2" => {
+                        build_ext2_from_staging(&staging_dir, &output_path, &section_name)?;
+                    }
+                    "gpt-ext2" => {
+                        build_gpt_ext2_from_staging(&staging_dir, &output_path, &section_name)?;
+                    }
+                    _ => unreachable!(),
                 }
 
                 new_lock.sections.insert(
                     section_name.clone(),
                     SectionLock {
-                        hash: staging_hash,
+                        hash: image_hash,
                         layers: layer_locks,
                         files: Vec::new(),
                         packages: Vec::new(),
@@ -2125,6 +2135,126 @@ fn topo_sort_images(
     Ok(result)
 }
 
+fn image_content_hash(format: &str, staging_hash: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(format!("format={format}\n").as_bytes());
+    hasher.update(format!("staging={staging_hash}\n").as_bytes());
+    format!("sha256:{}", hex::encode(hasher.finalize()))
+}
+
+fn build_gpt_ext2_from_staging(
+    staging_dir: &Path,
+    output_path: &Path,
+    section_name: &str,
+) -> Result<(), String> {
+    let output_parent = output_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(output_parent)
+        .map_err(|e| format!("failed to create {}: {e}", output_parent.display()))?;
+
+    let output_name = output_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("image");
+    let work_dir = output_parent.join(format!(
+        ".{output_name}.gpt-ext2-work.{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&work_dir);
+    fs::create_dir_all(&work_dir)
+        .map_err(|e| format!("failed to create {}: {e}", work_dir.display()))?;
+
+    let result = (|| {
+        let partition_image = work_dir.join("rootfs.ext2");
+        build_ext2_from_staging(staging_dir, &partition_image, section_name)?;
+
+        let partition_size = file_size(&partition_image)?;
+        let partition_lbas = partition_size.div_ceil(GPT_SECTOR_SIZE);
+        if partition_lbas == 0 {
+            return Err("generated ext2 partition image is empty".to_string());
+        }
+
+        let first_lba = GPT_FIRST_PARTITION_LBA;
+        let last_lba = first_lba
+            .checked_add(partition_lbas)
+            .and_then(|value| value.checked_sub(1))
+            .ok_or("GPT partition LBA range overflow")?;
+        let disk_lbas = last_lba
+            .checked_add(1)
+            .and_then(|value| value.checked_add(GPT_TRAILING_PADDING_LBAS))
+            .ok_or("GPT disk LBA count overflow")?;
+        let disk_size = disk_lbas
+            .checked_mul(GPT_SECTOR_SIZE)
+            .ok_or("GPT disk size overflow")?;
+
+        let _ = fs::remove_file(output_path);
+        let disk_file = fs::File::create(output_path)
+            .map_err(|e| format!("failed to create {}: {e}", output_path.display()))?;
+        disk_file
+            .set_len(disk_size)
+            .map_err(|e| format!("failed to size {}: {e}", output_path.display()))?;
+        drop(disk_file);
+
+        let mut disk_file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(output_path)
+            .map_err(|e| format!("failed to open {}: {e}", output_path.display()))?;
+        let pmbr_size = u32::try_from(disk_lbas.saturating_sub(1)).unwrap_or(u32::MAX);
+        let pmbr = gpt::mbr::ProtectiveMBR::with_lb_size(pmbr_size);
+        pmbr.overwrite_lba0(&mut disk_file)
+            .map_err(|e| format!("failed to write protective MBR: {e}"))?;
+
+        let mut gpt_disk = gpt::GptConfig::new()
+            .writable(true)
+            .logical_block_size(gpt::disk::LogicalBlockSize::Lb512)
+            .create_from_device(disk_file, None)
+            .map_err(|e| format!("failed to create GPT: {e}"))?;
+        gpt_disk
+            .add_partition_at(
+                "SCARLET_ROOT",
+                1,
+                first_lba,
+                partition_lbas,
+                gpt::partition_types::LINUX_FS,
+                0,
+            )
+            .map_err(|e| format!("failed to add GPT partition: {e}"))?;
+        let mut disk_file = gpt_disk
+            .write()
+            .map_err(|e| format!("failed to write GPT: {e}"))?;
+
+        disk_file
+            .seek(SeekFrom::Start(first_lba * GPT_SECTOR_SIZE))
+            .map_err(|e| format!("failed to seek {}: {e}", output_path.display()))?;
+        let mut partition_file = fs::File::open(&partition_image)
+            .map_err(|e| format!("failed to open {}: {e}", partition_image.display()))?;
+        std::io::copy(&mut partition_file, &mut disk_file)
+            .map_err(|e| format!("failed to copy ext2 partition into GPT image: {e}"))?;
+        disk_file
+            .sync_all()
+            .map_err(|e| format!("failed to sync {}: {e}", output_path.display()))?;
+
+        eprintln!(
+            "cargo-scarlet: wrote {} to {} (GPT, p1={}KB, offset={}KB)",
+            section_name,
+            output_path.display(),
+            partition_size.div_ceil(1024),
+            (first_lba * GPT_SECTOR_SIZE) / 1024
+        );
+        Ok(())
+    })();
+
+    let _ = fs::remove_dir_all(&work_dir);
+    result
+}
+
+const GPT_SECTOR_SIZE: u64 = 512;
+const GPT_FIRST_PARTITION_LBA: u64 = 2048;
+const GPT_TRAILING_PADDING_LBAS: u64 = 2048;
+
 fn build_ext2_from_staging(
     staging_dir: &Path,
     output_path: &Path,
@@ -2196,6 +2326,12 @@ fn build_ext2_from_staging(
         source_kb
     );
     Ok(())
+}
+
+fn file_size(path: &Path) -> Result<u64, String> {
+    fs::metadata(path)
+        .map(|metadata| metadata.len())
+        .map_err(|e| format!("failed to stat {}: {e}", path.display()))
 }
 
 fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
@@ -3912,6 +4048,46 @@ hash = "sha256:abc"
         );
 
         let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn gpt_ext2_image_contains_root_partition() {
+        if !command_exists("mke2fs") {
+            eprintln!("skipping gpt-ext2 image test: mke2fs not found");
+            return;
+        }
+
+        let temp = std::env::temp_dir().join(format!(
+            "cargo-scarlet-gpt-ext2-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&temp);
+        let staging = temp.join("staging");
+        fs::create_dir_all(staging.join("etc")).unwrap();
+        fs::write(staging.join("etc/issue"), "Scarlet\n").unwrap();
+        let output = temp.join("rootfs.img");
+
+        build_gpt_ext2_from_staging(&staging, &output, "rootfs").unwrap();
+
+        let disk = gpt::GptConfig::new().open(&output).unwrap();
+        let partition = disk.partitions().get(&1).expect("missing partition 1");
+        assert_eq!(partition.name, "SCARLET_ROOT");
+        assert_eq!(partition.first_lba, GPT_FIRST_PARTITION_LBA);
+        assert_eq!(partition.part_type_guid, gpt::partition_types::LINUX_FS);
+
+        let image_size = fs::metadata(&output).unwrap().len();
+        assert!(image_size > partition.last_lba * GPT_SECTOR_SIZE);
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    fn command_exists(command: &str) -> bool {
+        Command::new("sh")
+            .arg("-c")
+            .arg(format!("command -v {command} >/dev/null 2>&1"))
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
     }
 
     #[test]
