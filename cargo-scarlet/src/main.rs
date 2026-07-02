@@ -227,6 +227,20 @@ struct ManifestImageSection {
     layers: Vec<ManifestLayer>,
     #[serde(default)]
     deps: Vec<String>,
+    #[serde(default)]
+    partitions: Vec<ManifestGptPartition>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct ManifestGptPartition {
+    source: String,
+    name: String,
+    #[serde(rename = "type")]
+    type_name: String,
+    #[serde(default)]
+    flags: u64,
+    #[serde(default)]
+    alignment_lba: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -1952,6 +1966,39 @@ fn build_manifest_image(
                     },
                 );
             }
+            "gpt" => {
+                let gpt_hash = gpt_image_hash(project, &expanded.manifest.images, section_cfg)?;
+
+                if output_path.exists()
+                    && let Some(existing) = existing_lock.sections.get(&section_name)
+                    && existing.hash == gpt_hash
+                {
+                    eprintln!("cargo-scarlet: {} unchanged, skipping", section_name);
+                    new_lock
+                        .sections
+                        .insert(section_name.clone(), existing.clone());
+                    continue;
+                }
+
+                eprintln!("cargo-scarlet: building {}...", section_name);
+                build_gpt_image_from_partitions(
+                    project,
+                    &expanded.manifest.images,
+                    &section_cfg.partitions,
+                    &output_path,
+                    &section_name,
+                )?;
+
+                new_lock.sections.insert(
+                    section_name.clone(),
+                    SectionLock {
+                        hash: gpt_hash,
+                        layers: Vec::new(),
+                        files: Vec::new(),
+                        packages: Vec::new(),
+                    },
+                );
+            }
             "limine-uefi" => {
                 let arch_name = match target_triple.split('-').next() {
                     Some("aarch64") => "aarch64",
@@ -2140,6 +2187,203 @@ fn image_content_hash(format: &str, staging_hash: &str) -> String {
     hasher.update(format!("format={format}\n").as_bytes());
     hasher.update(format!("staging={staging_hash}\n").as_bytes());
     format!("sha256:{}", hex::encode(hasher.finalize()))
+}
+
+fn gpt_image_hash(
+    project: &Path,
+    images: &BTreeMap<String, ManifestImageSection>,
+    section: &ManifestImageSection,
+) -> Result<String, String> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"format=gpt\n");
+    for partition in &section.partitions {
+        let source_path = image_output_path(project, images, &partition.source)?;
+        hasher.update(format!("source={}\n", partition.source).as_bytes());
+        hasher.update(format!("path={}\n", source_path.display()).as_bytes());
+        hasher.update(format!("hash={}\n", sha256_file(&source_path)?).as_bytes());
+        hasher.update(format!("name={}\n", partition.name).as_bytes());
+        hasher.update(format!("type={}\n", partition.type_name).as_bytes());
+        hasher.update(format!("flags={}\n", partition.flags).as_bytes());
+        hasher.update(format!("alignment_lba={:?}\n", partition.alignment_lba).as_bytes());
+    }
+    Ok(format!("sha256:{}", hex::encode(hasher.finalize())))
+}
+
+fn build_gpt_image_from_partitions(
+    project: &Path,
+    images: &BTreeMap<String, ManifestImageSection>,
+    partitions: &[ManifestGptPartition],
+    output_path: &Path,
+    section_name: &str,
+) -> Result<(), String> {
+    if partitions.is_empty() {
+        return Err(format!(
+            "GPT image section '{section_name}' has no partitions"
+        ));
+    }
+
+    let output_parent = output_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(output_parent)
+        .map_err(|e| format!("failed to create {}: {e}", output_parent.display()))?;
+
+    let mut planned = Vec::new();
+    let mut next_lba = GPT_FIRST_PARTITION_LBA;
+    for (index, partition) in partitions.iter().enumerate() {
+        let source_path = image_output_path(project, images, &partition.source)?;
+        let size = file_size(&source_path)?;
+        if size == 0 {
+            return Err(format!(
+                "GPT partition '{}' source {} is empty",
+                partition.name,
+                source_path.display()
+            ));
+        }
+
+        let alignment_lba = partition.alignment_lba.unwrap_or(GPT_FIRST_PARTITION_LBA);
+        if alignment_lba == 0 {
+            return Err(format!(
+                "GPT partition '{}' alignment_lba must be greater than zero",
+                partition.name
+            ));
+        }
+        let length_lba = size.div_ceil(GPT_SECTOR_SIZE);
+        let first_lba = align_up(next_lba, alignment_lba)?;
+        let last_lba = first_lba
+            .checked_add(length_lba)
+            .and_then(|value| value.checked_sub(1))
+            .ok_or("GPT partition LBA range overflow")?;
+        planned.push(PlannedGptPartition {
+            id: u32::try_from(index + 1).map_err(|_| "too many GPT partitions")?,
+            source_path,
+            name: partition.name.clone(),
+            part_type: gpt_partition_type(&partition.type_name)?,
+            flags: partition.flags,
+            first_lba,
+            length_lba,
+            size,
+        });
+        next_lba = last_lba
+            .checked_add(1)
+            .ok_or("GPT disk LBA count overflow")?;
+    }
+
+    let disk_lbas = next_lba
+        .checked_add(GPT_TRAILING_PADDING_LBAS)
+        .ok_or("GPT disk LBA count overflow")?;
+    let disk_size = disk_lbas
+        .checked_mul(GPT_SECTOR_SIZE)
+        .ok_or("GPT disk size overflow")?;
+
+    let _ = fs::remove_file(output_path);
+    let disk_file = fs::File::create(output_path)
+        .map_err(|e| format!("failed to create {}: {e}", output_path.display()))?;
+    disk_file
+        .set_len(disk_size)
+        .map_err(|e| format!("failed to size {}: {e}", output_path.display()))?;
+    drop(disk_file);
+
+    let mut disk_file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(output_path)
+        .map_err(|e| format!("failed to open {}: {e}", output_path.display()))?;
+    let pmbr_size = u32::try_from(disk_lbas.saturating_sub(1)).unwrap_or(u32::MAX);
+    let pmbr = gpt::mbr::ProtectiveMBR::with_lb_size(pmbr_size);
+    pmbr.overwrite_lba0(&mut disk_file)
+        .map_err(|e| format!("failed to write protective MBR: {e}"))?;
+
+    let mut gpt_disk = gpt::GptConfig::new()
+        .writable(true)
+        .logical_block_size(gpt::disk::LogicalBlockSize::Lb512)
+        .create_from_device(disk_file, None)
+        .map_err(|e| format!("failed to create GPT: {e}"))?;
+    for partition in &planned {
+        gpt_disk
+            .add_partition_at(
+                &partition.name,
+                partition.id,
+                partition.first_lba,
+                partition.length_lba,
+                partition.part_type.clone(),
+                partition.flags,
+            )
+            .map_err(|e| format!("failed to add GPT partition '{}': {e}", partition.name))?;
+    }
+    let mut disk_file = gpt_disk
+        .write()
+        .map_err(|e| format!("failed to write GPT: {e}"))?;
+
+    for partition in &planned {
+        disk_file
+            .seek(SeekFrom::Start(partition.first_lba * GPT_SECTOR_SIZE))
+            .map_err(|e| format!("failed to seek {}: {e}", output_path.display()))?;
+        let mut source = fs::File::open(&partition.source_path)
+            .map_err(|e| format!("failed to open {}: {e}", partition.source_path.display()))?;
+        std::io::copy(&mut source, &mut disk_file).map_err(|e| {
+            format!(
+                "failed to copy {} into GPT image: {e}",
+                partition.source_path.display()
+            )
+        })?;
+        eprintln!(
+            "cargo-scarlet: {} p{} {} first_lba={} size={}KB",
+            section_name,
+            partition.id,
+            partition.name,
+            partition.first_lba,
+            partition.size.div_ceil(1024)
+        );
+    }
+    disk_file
+        .sync_all()
+        .map_err(|e| format!("failed to sync {}: {e}", output_path.display()))?;
+
+    eprintln!(
+        "cargo-scarlet: wrote {} to {} (GPT, {} partitions, {}KB)",
+        section_name,
+        output_path.display(),
+        planned.len(),
+        disk_size.div_ceil(1024)
+    );
+    Ok(())
+}
+
+struct PlannedGptPartition {
+    id: u32,
+    source_path: PathBuf,
+    name: String,
+    part_type: gpt::partition_types::Type,
+    flags: u64,
+    first_lba: u64,
+    length_lba: u64,
+    size: u64,
+}
+
+fn align_up(value: u64, alignment: u64) -> Result<u64, String> {
+    if alignment == 0 {
+        return Err("alignment must be greater than zero".to_string());
+    }
+    let remainder = value % alignment;
+    if remainder == 0 {
+        Ok(value)
+    } else {
+        value
+            .checked_add(alignment - remainder)
+            .ok_or("alignment overflow".to_string())
+    }
+}
+
+fn gpt_partition_type(type_name: &str) -> Result<gpt::partition_types::Type, String> {
+    let normalized = type_name.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "efi" | "efi-system" | "esp" => Ok(gpt::partition_types::EFI),
+        "linux" | "linux-filesystem" | "linux-fs" => Ok(gpt::partition_types::LINUX_FS),
+        "basic" | "basic-data" => Ok(gpt::partition_types::BASIC),
+        other => Err(format!("unsupported GPT partition type '{other}'")),
+    }
 }
 
 fn build_gpt_ext2_from_staging(
@@ -4077,6 +4321,81 @@ hash = "sha256:abc"
 
         let image_size = fs::metadata(&output).unwrap().len();
         assert!(image_size > partition.last_lba * GPT_SECTOR_SIZE);
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn gpt_image_composes_partition_payloads() {
+        let temp = std::env::temp_dir().join(format!(
+            "cargo-scarlet-gpt-compose-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&temp);
+        let images_dir = temp.join("images");
+        fs::create_dir_all(&images_dir).unwrap();
+        fs::write(images_dir.join("boot.img"), b"boot-payload").unwrap();
+        fs::write(images_dir.join("rootfs.ext2"), b"root-payload").unwrap();
+
+        let mut images = BTreeMap::new();
+        images.insert(
+            "boot".to_string(),
+            ManifestImageSection {
+                output: Some("images/boot.img".to_string()),
+                ..Default::default()
+            },
+        );
+        images.insert(
+            "rootfs".to_string(),
+            ManifestImageSection {
+                output: Some("images/rootfs.ext2".to_string()),
+                ..Default::default()
+            },
+        );
+        let partitions = vec![
+            ManifestGptPartition {
+                source: "boot".to_string(),
+                name: "SCARLET_BOOT".to_string(),
+                type_name: "efi-system".to_string(),
+                flags: 0,
+                alignment_lba: None,
+            },
+            ManifestGptPartition {
+                source: "rootfs".to_string(),
+                name: "SCARLET_ROOT".to_string(),
+                type_name: "linux-filesystem".to_string(),
+                flags: 0,
+                alignment_lba: None,
+            },
+        ];
+        let output = images_dir.join("disk.img");
+
+        build_gpt_image_from_partitions(&temp, &images, &partitions, &output, "disk").unwrap();
+
+        let disk = gpt::GptConfig::new().open(&output).unwrap();
+        let boot = disk.partitions().get(&1).expect("missing boot partition");
+        assert_eq!(boot.name, "SCARLET_BOOT");
+        assert_eq!(boot.first_lba, GPT_FIRST_PARTITION_LBA);
+        assert_eq!(boot.part_type_guid, gpt::partition_types::EFI);
+        let root = disk.partitions().get(&2).expect("missing root partition");
+        assert_eq!(root.name, "SCARLET_ROOT");
+        assert_eq!(root.first_lba, GPT_FIRST_PARTITION_LBA * 2);
+        assert_eq!(root.part_type_guid, gpt::partition_types::LINUX_FS);
+
+        let mut disk_file = fs::File::open(&output).unwrap();
+        let mut boot_payload = vec![0; b"boot-payload".len()];
+        disk_file
+            .seek(SeekFrom::Start(boot.first_lba * GPT_SECTOR_SIZE))
+            .unwrap();
+        disk_file.read_exact(&mut boot_payload).unwrap();
+        assert_eq!(&boot_payload, b"boot-payload");
+
+        let mut root_payload = vec![0; b"root-payload".len()];
+        disk_file
+            .seek(SeekFrom::Start(root.first_lba * GPT_SECTOR_SIZE))
+            .unwrap();
+        disk_file.read_exact(&mut root_payload).unwrap();
+        assert_eq!(&root_payload, b"root-payload");
 
         let _ = fs::remove_dir_all(&temp);
     }
