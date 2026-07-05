@@ -1920,15 +1920,19 @@ fn build_manifest_image(
                 let staging_hash = sha256_dir(&staging_dir)?;
                 let image_hash = image_content_hash(format, &staging_hash);
 
-                if output_path.exists()
-                    && let Some(existing) = existing_lock.sections.get(&section_name)
-                    && existing.hash == image_hash
-                {
+                let existing_section_lock = existing_lock.sections.get(&section_name);
+                if image_output_is_current(
+                    project,
+                    &section_name,
+                    &output_path,
+                    &image_hash,
+                    existing_section_lock,
+                ) {
                     eprintln!(
                         "cargo-scarlet: {} unchanged, skipping image generation",
                         section_name
                     );
-                    let mut updated = existing.clone();
+                    let mut updated = existing_section_lock.unwrap().clone();
                     updated.layers = layer_locks;
                     updated.packages = Vec::new();
                     updated.files = Vec::new();
@@ -1956,6 +1960,8 @@ fn build_manifest_image(
                     _ => unreachable!(),
                 }
 
+                write_image_stamp(project, &section_name, &output_path, &image_hash)?;
+
                 new_lock.sections.insert(
                     section_name.clone(),
                     SectionLock {
@@ -1969,14 +1975,18 @@ fn build_manifest_image(
             "gpt" => {
                 let gpt_hash = gpt_image_hash(project, &expanded.manifest.images, section_cfg)?;
 
-                if output_path.exists()
-                    && let Some(existing) = existing_lock.sections.get(&section_name)
-                    && existing.hash == gpt_hash
-                {
+                let existing_section_lock = existing_lock.sections.get(&section_name);
+                if image_output_is_current(
+                    project,
+                    &section_name,
+                    &output_path,
+                    &gpt_hash,
+                    existing_section_lock,
+                ) {
                     eprintln!("cargo-scarlet: {} unchanged, skipping", section_name);
                     new_lock
                         .sections
-                        .insert(section_name.clone(), existing.clone());
+                        .insert(section_name.clone(), existing_section_lock.unwrap().clone());
                     continue;
                 }
 
@@ -1988,6 +1998,8 @@ fn build_manifest_image(
                     &output_path,
                     &section_name,
                 )?;
+
+                write_image_stamp(project, &section_name, &output_path, &gpt_hash)?;
 
                 new_lock.sections.insert(
                     section_name.clone(),
@@ -2035,14 +2047,18 @@ fn build_manifest_image(
                 }
                 let limine_hash = format!("sha256:{}", hex::encode(limine_hasher.finalize()));
 
-                if output_path.exists()
-                    && let Some(existing) = existing_lock.sections.get(&section_name)
-                    && existing.hash == limine_hash
-                {
+                let existing_section_lock = existing_lock.sections.get(&section_name);
+                if image_output_is_current(
+                    project,
+                    &section_name,
+                    &output_path,
+                    &limine_hash,
+                    existing_section_lock,
+                ) {
                     eprintln!("cargo-scarlet: {} unchanged, skipping", section_name);
                     new_lock
                         .sections
-                        .insert(section_name.clone(), existing.clone());
+                        .insert(section_name.clone(), existing_section_lock.unwrap().clone());
                     continue;
                 }
 
@@ -2077,6 +2093,8 @@ fn build_manifest_image(
                     section_name,
                     output_path.display()
                 );
+
+                write_image_stamp(project, &section_name, &output_path, &limine_hash)?;
 
                 new_lock.sections.insert(
                     section_name.clone(),
@@ -2187,6 +2205,73 @@ fn image_content_hash(format: &str, staging_hash: &str) -> String {
     hasher.update(format!("format={format}\n").as_bytes());
     hasher.update(format!("staging={staging_hash}\n").as_bytes());
     format!("sha256:{}", hex::encode(hasher.finalize()))
+}
+
+fn image_output_is_current(
+    project: &Path,
+    section_name: &str,
+    output_path: &Path,
+    expected_hash: &str,
+    existing_lock: Option<&SectionLock>,
+) -> bool {
+    output_path.exists()
+        && existing_lock.is_some_and(|existing| existing.hash == expected_hash)
+        && image_stamp_matches(project, section_name, output_path, expected_hash)
+}
+
+fn image_stamp_matches(
+    project: &Path,
+    section_name: &str,
+    output_path: &Path,
+    expected_hash: &str,
+) -> bool {
+    let Ok(text) = fs::read_to_string(image_stamp_path(project, section_name)) else {
+        return false;
+    };
+
+    let expected_output = output_path.display().to_string();
+    let mut hash_matches = false;
+    let mut output_matches = false;
+    for line in text.lines() {
+        if let Some(hash) = line.strip_prefix("hash = ") {
+            hash_matches = hash == expected_hash;
+        } else if let Some(output) = line.strip_prefix("output = ") {
+            output_matches = output == expected_output;
+        }
+    }
+    hash_matches && output_matches
+}
+
+fn write_image_stamp(
+    project: &Path,
+    section_name: &str,
+    output_path: &Path,
+    hash: &str,
+) -> Result<(), String> {
+    let stamp_path = image_stamp_path(project, section_name);
+    if let Some(parent) = stamp_path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+    }
+    let text = format!("hash = {hash}\noutput = {}\n", output_path.display());
+    fs::write(&stamp_path, text)
+        .map_err(|e| format!("failed to write {}: {e}", stamp_path.display()))
+}
+
+fn image_stamp_path(project: &Path, section_name: &str) -> PathBuf {
+    let safe_name: String = section_name
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    project
+        .join(".scarlet/image-stamps")
+        .join(format!("{safe_name}.stamp"))
 }
 
 fn gpt_image_hash(
@@ -4407,6 +4492,59 @@ hash = "sha256:abc"
             .status()
             .map(|status| status.success())
             .unwrap_or(false)
+    }
+
+    #[test]
+    fn image_stamp_must_match_hash_and_output() {
+        let temp = std::env::temp_dir().join(format!(
+            "cargo-scarlet-image-stamp-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&temp);
+        fs::create_dir_all(&temp).unwrap();
+        let output = temp.join("images/rootfs.ext2");
+        fs::create_dir_all(output.parent().unwrap()).unwrap();
+        fs::write(&output, b"rootfs").unwrap();
+
+        let lock = SectionLock {
+            hash: "sha256:new".to_string(),
+            layers: Vec::new(),
+            files: Vec::new(),
+            packages: Vec::new(),
+        };
+
+        assert!(!image_output_is_current(
+            &temp,
+            "rootfs",
+            &output,
+            "sha256:new",
+            Some(&lock)
+        ));
+
+        write_image_stamp(&temp, "rootfs", &output, "sha256:new").unwrap();
+        assert!(image_output_is_current(
+            &temp,
+            "rootfs",
+            &output,
+            "sha256:new",
+            Some(&lock)
+        ));
+        assert!(!image_output_is_current(
+            &temp,
+            "rootfs",
+            &output,
+            "sha256:old",
+            Some(&lock)
+        ));
+        assert!(!image_output_is_current(
+            &temp,
+            "rootfs",
+            &temp.join("images/other.ext2"),
+            "sha256:new",
+            Some(&lock)
+        ));
+
+        fs::remove_dir_all(&temp).unwrap();
     }
 
     #[test]
