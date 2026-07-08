@@ -259,6 +259,13 @@ enum ManifestLayer {
         source: PackageSource,
         package: Option<String>,
         bin: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        features: Vec<String>,
+        #[serde(rename = "default-features")]
+        #[serde(skip_serializing_if = "Option::is_none")]
+        default_features: Option<bool>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        replace: bool,
         to: String,
     },
     Script {
@@ -349,6 +356,11 @@ struct PackageLock {
     package: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     bin: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    features: Vec<String>,
+    #[serde(rename = "default-features")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    default_features: Option<bool>,
     #[serde(default)]
     to: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -380,6 +392,11 @@ enum LayerLock {
         package: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         bin: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        features: Vec<String>,
+        #[serde(rename = "default-features")]
+        #[serde(skip_serializing_if = "Option::is_none")]
+        default_features: Option<bool>,
         #[serde(default)]
         to: String,
         hash: String,
@@ -436,6 +453,8 @@ impl SectionLock {
                     resolved_rev,
                     package,
                     bin,
+                    features,
+                    default_features,
                     to,
                     hash,
                 } => Some(PackageLock {
@@ -446,6 +465,8 @@ impl SectionLock {
                     resolved_rev: resolved_rev.clone(),
                     package: package.clone(),
                     bin: bin.clone(),
+                    features: features.clone(),
+                    default_features: *default_features,
                     to: to.clone(),
                     output: None,
                     hash: hash.clone(),
@@ -463,6 +484,8 @@ impl SectionLock {
                     resolved_rev: None,
                     package: None,
                     bin: None,
+                    features: Vec::new(),
+                    default_features: None,
                     to: to.clone(),
                     output: output.clone(),
                     hash: hash.clone(),
@@ -507,6 +530,8 @@ fn package_lock_to_layer(lock: PackageLock) -> LayerLock {
             resolved_rev: lock.resolved_rev,
             package: lock.package,
             bin: lock.bin,
+            features: lock.features,
+            default_features: lock.default_features,
             to: lock.to,
             hash: lock.hash,
         },
@@ -546,6 +571,12 @@ fn package_lock_matches_input(
         return Ok(false);
     }
     if lock.bin != pkg.bin {
+        return Ok(false);
+    }
+    if lock.features != pkg.features {
+        return Ok(false);
+    }
+    if lock.default_features != pkg.default_features {
         return Ok(false);
     }
     if lock.to != pkg.to {
@@ -591,6 +622,8 @@ fn package_input_lock(
         resolved_rev: pkg.resolved_rev.clone(),
         package: pkg.package_name.clone(),
         bin: pkg.bin.clone(),
+        features: pkg.features.clone(),
+        default_features: pkg.default_features,
         to: pkg.to.clone(),
         output: package_output_lock_path(project, pkg)?,
         hash,
@@ -614,6 +647,8 @@ fn find_package_lock_for_input(
         lock.kind == pkg.kind.as_deref().unwrap_or("")
             && lock.source == source
             && lock.bin == pkg.bin
+            && lock.features == pkg.features
+            && lock.default_features == pkg.default_features
             && lock.git == package_git_url(pkg)
     }))
 }
@@ -625,6 +660,8 @@ struct ResolvedPackage {
     resolved_rev: Option<String>,
     package_name: Option<String>,
     bin: Option<String>,
+    features: Vec<String>,
+    default_features: Option<bool>,
     from: Option<PathBuf>,
     to: String,
     output: Option<PathBuf>,
@@ -635,6 +672,8 @@ struct PackageLayerSpec {
     source: Option<PackageSource>,
     package: Option<String>,
     bin: Option<String>,
+    features: Vec<String>,
+    default_features: Option<bool>,
     from: Option<String>,
     to: String,
     output: Option<String>,
@@ -754,6 +793,8 @@ fn resolve_package(
         resolved_rev: None,
         package_name: pkg.package.clone(),
         bin: pkg.bin.clone(),
+        features: pkg.features.clone(),
+        default_features: pkg.default_features,
         from: pkg.from.as_ref().and_then(|s| {
             if images.contains_key(s.as_str()) {
                 None
@@ -1091,6 +1132,9 @@ fn resolve_layers(
                 source,
                 package,
                 bin,
+                features,
+                default_features,
+                replace,
                 to,
             } => {
                 let pkg = PackageLayerSpec {
@@ -1098,16 +1142,24 @@ fn resolve_layers(
                     source: Some(source.clone()),
                     package: package.clone(),
                     bin: bin.clone(),
+                    features: features.clone(),
+                    default_features: *default_features,
                     from: None,
                     to: to.clone(),
                     output: None,
                 };
-                resolved.push(ResolvedLayer::Package(resolve_package(
-                    &pkg,
-                    base_dir,
-                    &ctx.target_triple,
-                    images,
-                )));
+                let resolved_pkg = resolve_package(&pkg, base_dir, &ctx.target_triple, images);
+                if *replace {
+                    resolved.retain(|layer| {
+                        !matches!(
+                            layer,
+                            ResolvedLayer::Package(existing)
+                                if existing.kind.as_deref() == Some("cargo")
+                                    && existing.to == resolved_pkg.to
+                        )
+                    });
+                }
+                resolved.push(ResolvedLayer::Package(resolved_pkg));
             }
             ManifestLayer::Script { source, output, to } => {
                 let pkg = PackageLayerSpec {
@@ -1115,6 +1167,8 @@ fn resolve_layers(
                     source: Some(PackageSource::Path(source.clone())),
                     package: None,
                     bin: None,
+                    features: Vec::new(),
+                    default_features: None,
                     from: None,
                     to: to.clone(),
                     output: output.clone(),
@@ -2932,6 +2986,12 @@ fn install_package(
                 if let Some(bin) = pkg.bin.as_deref() {
                     cmd.arg("--bin").arg(bin);
                 }
+                if pkg.default_features == Some(false) {
+                    cmd.arg("--no-default-features");
+                }
+                if !pkg.features.is_empty() {
+                    cmd.arg("--features").arg(pkg.features.join(","));
+                }
 
                 let status = cmd
                     .current_dir(source)
@@ -2979,6 +3039,8 @@ fn install_package(
                 resolved_rev,
                 package: pkg.package_name.clone(),
                 bin: pkg.bin.clone(),
+                features: pkg.features.clone(),
+                default_features: pkg.default_features,
                 to: pkg.to.clone(),
                 output: None,
                 hash,
@@ -3094,6 +3156,8 @@ fn install_package(
                 resolved_rev: None,
                 package: None,
                 bin: None,
+                features: Vec::new(),
+                default_features: None,
                 to: pkg.to.clone(),
                 output: package_output_lock_path(project, pkg)?,
                 hash,
@@ -4177,6 +4241,8 @@ mod tests {
             resolved_rev: None,
             package: None,
             bin: Some("sh".to_string()),
+            features: Vec::new(),
+            default_features: None,
             to: "/bin/sh".to_string(),
             output: None,
             hash: "sha256:abc".to_string(),
@@ -4211,6 +4277,8 @@ mod tests {
             resolved_rev: Some("abc123".to_string()),
             package: None,
             bin: Some("tool".to_string()),
+            features: Vec::new(),
+            default_features: None,
             to: "/bin/tool".to_string(),
             output: None,
             hash: "sha256:def".to_string(),
@@ -4241,6 +4309,91 @@ hash = "sha256:abc"
     }
 
     #[test]
+    fn bundle_cargo_layer_accepts_feature_controls() {
+        let toml_str = r#"
+[[layers]]
+kind = "cargo"
+source = "../../user/video_player"
+package = "video_player"
+bin = "video_player"
+default-features = false
+features = ["h264-stateful-hw", "mp4-aac"]
+replace = true
+to = "/system/scarlet/bin/video_player"
+"#;
+        let bundle: BundleManifest = toml::from_str(toml_str).unwrap();
+        let ManifestLayer::Cargo {
+            features,
+            default_features,
+            replace,
+            ..
+        } = &bundle.layers[0]
+        else {
+            panic!("expected cargo layer");
+        };
+
+        assert_eq!(default_features, &Some(false));
+        assert!(*replace);
+        assert_eq!(
+            features,
+            &vec!["h264-stateful-hw".to_string(), "mp4-aac".to_string()]
+        );
+    }
+
+    #[test]
+    fn cargo_layer_replace_removes_previous_same_destination() {
+        let layers = vec![
+            ManifestLayer::Cargo {
+                source: PackageSource::Path("user/video_player".to_string()),
+                package: Some("video_player".to_string()),
+                bin: Some("video_player".to_string()),
+                features: vec!["h264-stateful-hw".to_string(), "mp4-aac".to_string()],
+                default_features: Some(false),
+                replace: false,
+                to: "/system/scarlet/bin/video_player".to_string(),
+            },
+            ManifestLayer::Cargo {
+                source: PackageSource::Path("user/video_player".to_string()),
+                package: Some("video_player".to_string()),
+                bin: Some("video_player".to_string()),
+                features: vec![
+                    "h264-stateful-hw".to_string(),
+                    "h264-stateless-hw".to_string(),
+                    "mp4-aac".to_string(),
+                ],
+                default_features: Some(false),
+                replace: true,
+                to: "/system/scarlet/bin/video_player".to_string(),
+            },
+        ];
+        let ctx = TemplateContext {
+            arch: "aarch64".to_string(),
+            target_triple: "aarch64-unknown-none-elf".to_string(),
+            project: "test".to_string(),
+        };
+        let images = BTreeMap::new();
+
+        let resolved = resolve_layers(&layers, Path::new("/tmp/scarlet"), &ctx, &images).unwrap();
+        let packages: Vec<_> = resolved
+            .iter()
+            .filter_map(|layer| match layer {
+                ResolvedLayer::Package(pkg) => Some(pkg),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(packages.len(), 1);
+        assert_eq!(
+            packages[0].features,
+            vec![
+                "h264-stateful-hw".to_string(),
+                "h264-stateless-hw".to_string(),
+                "mp4-aac".to_string(),
+            ]
+        );
+    }
+
+    #[test]
     fn package_lock_matches_all_input_fields() {
         let project = Path::new("/Users/foo/project");
         let lock = PackageLock {
@@ -4251,6 +4404,8 @@ hash = "sha256:abc"
             resolved_rev: None,
             package: Some("apps".to_string()),
             bin: Some("sh".to_string()),
+            features: vec!["h264-stateful-hw".to_string()],
+            default_features: Some(false),
             to: "/bin/sh".to_string(),
             output: None,
             hash: String::new(),
@@ -4262,6 +4417,8 @@ hash = "sha256:abc"
             resolved_rev: None,
             package_name: Some("apps".to_string()),
             bin: Some("sh".to_string()),
+            features: vec!["h264-stateful-hw".to_string()],
+            default_features: Some(false),
             from: None,
             to: "/bin/sh".to_string(),
             output: None,
@@ -4270,6 +4427,9 @@ hash = "sha256:abc"
         assert!(package_lock_matches_input(project, &lock, &pkg).unwrap());
 
         pkg.to = "/usr/bin/sh".to_string();
+        assert!(!package_lock_matches_input(project, &lock, &pkg).unwrap());
+        pkg.to = "/bin/sh".to_string();
+        pkg.features = vec!["vp9-stateless-hw".to_string()];
         assert!(!package_lock_matches_input(project, &lock, &pkg).unwrap());
     }
 
