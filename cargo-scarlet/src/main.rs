@@ -1097,6 +1097,17 @@ fn resolve_layers(
     images: &BTreeMap<String, ManifestImageSection>,
 ) -> Result<Vec<ResolvedLayer>, String> {
     let mut resolved = Vec::new();
+    resolve_layers_into(&mut resolved, layers, base_dir, ctx, images)?;
+    Ok(resolved)
+}
+
+fn resolve_layers_into(
+    resolved: &mut Vec<ResolvedLayer>,
+    layers: &[ManifestLayer],
+    base_dir: &Path,
+    ctx: &TemplateContext,
+    images: &BTreeMap<String, ManifestImageSection>,
+) -> Result<(), String> {
     for layer in layers {
         match layer {
             ManifestLayer::Bundle { path } => {
@@ -1107,7 +1118,7 @@ fn resolve_layers(
                 let bundle: BundleManifest = toml::from_str(&text).map_err(|e| {
                     format!("failed to parse bundle {}: {e}", bundle_path.display())
                 })?;
-                resolved.extend(resolve_layers(&bundle.layers, bundle_dir, ctx, images)?);
+                resolve_layers_into(resolved, &bundle.layers, bundle_dir, ctx, images)?;
             }
             ManifestLayer::Copy {
                 source,
@@ -1191,7 +1202,7 @@ fn resolve_layers(
             }
         }
     }
-    Ok(resolved)
+    Ok(())
 }
 
 fn expand_manifest(project_dir: &Path) -> Result<ExpandedManifest, String> {
@@ -4391,6 +4402,83 @@ to = "/system/scarlet/bin/video_player"
                 "mp4-aac".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn nested_bundle_cargo_replace_removes_previous_destination() {
+        let temp = std::env::temp_dir().join(format!(
+            "cargo-scarlet-nested-replace-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&temp);
+        fs::create_dir_all(temp.join("bundles/desktop")).unwrap();
+        fs::create_dir_all(temp.join("bundles/experimental")).unwrap();
+        fs::write(
+            temp.join("bundles/desktop/bundle.toml"),
+            r#"
+[[layers]]
+kind = "cargo"
+source = "../../user/video_player"
+package = "video_player"
+bin = "video_player"
+default-features = false
+features = ["av1-stateful-hw", "h264-stateful-hw", "mp4-aac"]
+to = "/system/scarlet/bin/video_player"
+"#,
+        )
+        .unwrap();
+        fs::write(
+            temp.join("bundles/experimental/bundle.toml"),
+            r#"
+[[layers]]
+kind = "cargo"
+source = "../../user/video_player"
+package = "video_player"
+bin = "video_player"
+default-features = false
+features = ["av1-stateful-hw", "h264-stateful-hw", "h264-stateless-hw", "mp4-aac"]
+replace = true
+to = "/system/scarlet/bin/video_player"
+"#,
+        )
+        .unwrap();
+
+        let layers = vec![
+            ManifestLayer::Bundle {
+                path: "bundles/desktop/bundle.toml".to_string(),
+            },
+            ManifestLayer::Bundle {
+                path: "bundles/experimental/bundle.toml".to_string(),
+            },
+        ];
+        let ctx = TemplateContext {
+            arch: "aarch64".to_string(),
+            target_triple: "aarch64-unknown-none-elf".to_string(),
+            project: "test".to_string(),
+        };
+        let images = BTreeMap::new();
+
+        let resolved = resolve_layers(&layers, &temp, &ctx, &images).unwrap();
+        let packages: Vec<_> = resolved
+            .iter()
+            .filter_map(|layer| match layer {
+                ResolvedLayer::Package(pkg) => Some(pkg),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(packages.len(), 1);
+        assert_eq!(
+            packages[0].features,
+            vec![
+                "av1-stateful-hw".to_string(),
+                "h264-stateful-hw".to_string(),
+                "h264-stateless-hw".to_string(),
+                "mp4-aac".to_string(),
+            ]
+        );
+
+        fs::remove_dir_all(&temp).unwrap();
     }
 
     #[test]
