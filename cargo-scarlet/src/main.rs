@@ -197,7 +197,36 @@ struct ManifestBsp {
 struct ManifestBspKernel {
     source: PackageSource,
     #[serde(default)]
-    features: Vec<String>,
+    features: KernelFeatureConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum KernelFeatureConfig {
+    List(Vec<String>),
+    States(BTreeMap<String, bool>),
+}
+
+impl Default for KernelFeatureConfig {
+    fn default() -> Self {
+        Self::List(Vec::new())
+    }
+}
+
+impl KernelFeatureConfig {
+    fn enabled(&self) -> Vec<String> {
+        match self {
+            Self::List(features) => features.clone(),
+            Self::States(features) => enabled_feature_names(features),
+        }
+    }
+
+    fn disabled(&self) -> Vec<String> {
+        match self {
+            Self::List(_) => Vec::new(),
+            Self::States(features) => disabled_feature_names(features),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -214,6 +243,7 @@ struct BspConfig<'a> {
     package: &'a str,
     kernel_source: &'a PackageSource,
     kernel_features: Vec<String>,
+    disabled_kernel_features: Vec<String>,
     build_target: String,
 }
 
@@ -830,7 +860,8 @@ fn manifest_bsp_config<'a>(
             root,
             package: &bsp.package,
             kernel_source: &bsp.kernel.source,
-            kernel_features: bsp.kernel.features.clone(),
+            kernel_features: bsp.kernel.features.enabled(),
+            disabled_kernel_features: bsp.kernel.features.disabled(),
             build_target,
         });
     }
@@ -844,6 +875,7 @@ fn manifest_bsp_config<'a>(
         package: &kernel.package,
         kernel_source: &kernel.source,
         kernel_features: enabled_feature_names(&kernel.features),
+        disabled_kernel_features: disabled_feature_names(&kernel.features),
         build_target: kernel.target_json.clone(),
     })
 }
@@ -866,6 +898,14 @@ fn enabled_feature_names(features: &BTreeMap<String, bool>) -> Vec<String> {
     features
         .iter()
         .filter(|(_, enabled)| **enabled)
+        .map(|(feature, _)| feature.clone())
+        .collect()
+}
+
+fn disabled_feature_names(features: &BTreeMap<String, bool>) -> Vec<String> {
+    features
+        .iter()
+        .filter(|(_, enabled)| !**enabled)
         .map(|(feature, _)| feature.clone())
         .collect()
 }
@@ -1691,7 +1731,12 @@ fn cargo_build_manifest(
         .unwrap_or_else(|| bsp.build_target.clone());
     let target_arg = build_target_arg(&bsp.root, &resolved_target);
 
-    metadata_check(&bsp.root, &target_arg)?;
+    metadata_check(
+        &bsp.root,
+        &target_arg,
+        bsp.package,
+        &bsp.disabled_kernel_features,
+    )?;
 
     let mut command = Command::new("cargo");
     command.arg(subcommand);
@@ -3323,7 +3368,35 @@ fn write_if_changed(path: &Path, contents: &str) -> Result<(), String> {
         .map_err(|error| format!("failed to write {}: {error}", path.display()))
 }
 
-fn metadata_check(project: &Path, target: &str) -> Result<(), String> {
+#[derive(Debug, Deserialize)]
+struct CargoMetadata {
+    packages: Vec<CargoMetadataPackage>,
+    resolve: Option<CargoResolve>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CargoMetadataPackage {
+    id: String,
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CargoResolve {
+    nodes: Vec<CargoResolveNode>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CargoResolveNode {
+    id: String,
+    features: Vec<String>,
+}
+
+fn metadata_check(
+    project: &Path,
+    target: &str,
+    kernel_package: &str,
+    disabled_kernel_features: &[String],
+) -> Result<(), String> {
     let mut command = Command::new("cargo");
     command
         .arg("metadata")
@@ -3343,14 +3416,66 @@ fn metadata_check(project: &Path, target: &str) -> Result<(), String> {
             .join(" ")
     );
 
-    let status = command
-        .status()
+    let output = command
+        .output()
         .map_err(|error| format!("failed to run cargo metadata: {error}"))?;
 
-    if status.success() {
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "cargo metadata failed with status {}: {stderr}",
+            output.status
+        ));
+    }
+
+    let metadata: CargoMetadata = serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("failed to parse cargo metadata output: {error}"))?;
+    ensure_disabled_kernel_features(&metadata, kernel_package, disabled_kernel_features)
+}
+
+fn ensure_disabled_kernel_features(
+    metadata: &CargoMetadata,
+    kernel_package: &str,
+    disabled_kernel_features: &[String],
+) -> Result<(), String> {
+    if disabled_kernel_features.is_empty() {
+        return Ok(());
+    }
+
+    let package_ids = metadata
+        .packages
+        .iter()
+        .filter(|package| package.name == kernel_package)
+        .map(|package| package.id.as_str())
+        .collect::<Vec<_>>();
+    if package_ids.is_empty() {
+        return Err(format!(
+            "kernel package `{kernel_package}` was not found in cargo metadata"
+        ));
+    }
+
+    let resolve = metadata
+        .resolve
+        .as_ref()
+        .ok_or("cargo metadata did not include a dependency resolve graph")?;
+    let mut conflicts = resolve
+        .nodes
+        .iter()
+        .filter(|node| package_ids.contains(&node.id.as_str()))
+        .flat_map(|node| node.features.iter())
+        .filter(|feature| disabled_kernel_features.contains(feature))
+        .cloned()
+        .collect::<Vec<_>>();
+    conflicts.sort();
+    conflicts.dedup();
+
+    if conflicts.is_empty() {
         Ok(())
     } else {
-        Err(format!("cargo metadata failed with status {status}"))
+        Err(format!(
+            "kernel feature(s) explicitly disabled in scarlet.toml were enabled by Cargo feature unification: {}",
+            conflicts.join(", ")
+        ))
     }
 }
 
@@ -4240,6 +4365,54 @@ fn which(cmd: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn metadata_with_kernel_features(features: &[&str]) -> CargoMetadata {
+        CargoMetadata {
+            packages: vec![CargoMetadataPackage {
+                id: "path+file:///kernel#scarlet@0.16.0".to_string(),
+                name: "scarlet".to_string(),
+            }],
+            resolve: Some(CargoResolve {
+                nodes: vec![CargoResolveNode {
+                    id: "path+file:///kernel#scarlet@0.16.0".to_string(),
+                    features: features
+                        .iter()
+                        .map(|feature| (*feature).to_string())
+                        .collect(),
+                }],
+            }),
+        }
+    }
+
+    #[test]
+    fn feature_states_separate_enabled_and_disabled_features() {
+        let features = KernelFeatureConfig::States(BTreeMap::from([
+            ("hypervisor".to_string(), false),
+            ("limine".to_string(), true),
+        ]));
+
+        assert_eq!(features.enabled(), vec!["limine"]);
+        assert_eq!(features.disabled(), vec!["hypervisor"]);
+    }
+
+    #[test]
+    fn explicitly_disabled_kernel_feature_rejects_cargo_conflict() {
+        let metadata = metadata_with_kernel_features(&["hypervisor", "limine"]);
+
+        let error =
+            ensure_disabled_kernel_features(&metadata, "scarlet", &["hypervisor".to_string()])
+                .expect_err("hypervisor must conflict");
+
+        assert!(error.contains("hypervisor"));
+    }
+
+    #[test]
+    fn explicitly_disabled_kernel_feature_allows_absent_feature() {
+        let metadata = metadata_with_kernel_features(&["limine"]);
+
+        ensure_disabled_kernel_features(&metadata, "scarlet", &["hypervisor".to_string()])
+            .expect("absent hypervisor must be accepted");
+    }
 
     #[test]
     fn lock_source_path_serializes_to_table() {
