@@ -6,6 +6,8 @@ use std::process::{Command, ExitCode};
 use clap::{Parser, ValueEnum};
 use serde::Deserialize;
 
+const DEFAULT_LIMINE_VERSION: &str = "12.4.0";
+
 #[derive(Parser, Debug)]
 #[command(name = "cargo-scarlet-plugin-limine")]
 #[command(about = "Build Limine UEFI boot images for Scarlet projects")]
@@ -24,7 +26,7 @@ struct Cli {
     image_slack_mb: u64,
     #[arg(long)]
     boot_image_size_mb: Option<u64>,
-    #[arg(long, default_value = "11.0.0")]
+    #[arg(long, default_value = DEFAULT_LIMINE_VERSION)]
     limine_version: String,
     #[arg(long)]
     cache_dir: Option<PathBuf>,
@@ -146,7 +148,7 @@ impl PluginRequest {
             cmdline: self.section.cmdline,
             image_slack_mb: 32,
             boot_image_size_mb: None,
-            limine_version: "11.0.0".to_string(),
+            limine_version: DEFAULT_LIMINE_VERSION.to_string(),
             cache_dir: None,
         })
     }
@@ -179,10 +181,12 @@ impl PluginSource {
 fn build_limine_image(cli: &Cli) -> Result<(), String> {
     require_file(&cli.kernel)?;
     require_file(&cli.initramfs)?;
+    require_command("curl")?;
     require_command("git")?;
     require_command("mformat")?;
     require_command("mmd")?;
     require_command("mcopy")?;
+    require_command("tar")?;
 
     let spec = cli.arch.spec();
     let output_parent = cli
@@ -320,6 +324,45 @@ fn ensure_limine_source(cache_dir: &Path, version: &str) -> Result<PathBuf, Stri
     }
     fs::create_dir_all(cache_dir)
         .map_err(|error| format!("failed to create {}: {error}", cache_dir.display()))?;
+
+    let major = version
+        .split('.')
+        .next()
+        .ok_or_else(|| format!("invalid Limine version: {version}"))?
+        .parse::<u64>()
+        .map_err(|error| format!("invalid Limine version {version}: {error}"))?;
+    if major >= 12 {
+        let archive = cache_dir.join(format!("limine-{version}-binary.tar.gz"));
+        let url = format!(
+            "https://github.com/Limine-Bootloader/Limine/releases/download/v{version}/limine-binary.tar.gz"
+        );
+        run(
+            "curl",
+            &[
+                "--fail",
+                "--location",
+                "--output",
+                path_str(&archive)?,
+                &url,
+            ],
+        )?;
+        fs::create_dir_all(&limine_dir)
+            .map_err(|error| format!("failed to create {}: {error}", limine_dir.display()))?;
+        run(
+            "tar",
+            &[
+                "-xzf",
+                path_str(&archive)?,
+                "--strip-components=1",
+                "-C",
+                path_str(&limine_dir)?,
+            ],
+        )?;
+        fs::remove_file(&archive)
+            .map_err(|error| format!("failed to remove {}: {error}", archive.display()))?;
+        return Ok(limine_dir);
+    }
+
     let branch = format!("v{version}-binary");
     let destination = path_str(&limine_dir)?.to_string();
     run(
@@ -388,4 +431,31 @@ fn file_size(path: &Path) -> Result<u64, String> {
 fn align_up_mb(bytes: u64) -> u64 {
     let mb = bytes.div_ceil(1024 * 1024);
     mb.div_ceil(16) * 16
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cli, Parser};
+
+    #[test]
+    fn cli_uses_vhe_capable_limine_by_default() {
+        // Given: a complete CLI invocation without an explicit Limine version.
+        let args = [
+            "cargo-scarlet-plugin-limine",
+            "--arch",
+            "aarch64",
+            "--kernel",
+            "kernel.elf",
+            "--initramfs",
+            "initramfs.cpio",
+            "--output",
+            "scarlet.img",
+        ];
+
+        // When: clap resolves the default arguments.
+        let cli = Cli::try_parse_from(args).expect("the test CLI arguments should parse");
+
+        // Then: the selected Limine release contains AArch64 EL2/VHE boot support.
+        assert_eq!(cli.limine_version, "12.4.0");
+    }
 }
