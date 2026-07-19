@@ -19,6 +19,8 @@ struct Cli {
     #[arg(long)]
     initramfs: PathBuf,
     #[arg(long)]
+    dtb: Option<PathBuf>,
+    #[arg(long)]
     output: PathBuf,
     #[arg(long)]
     cmdline: Option<String>,
@@ -30,6 +32,8 @@ struct Cli {
     limine_version: String,
     #[arg(long)]
     cache_dir: Option<PathBuf>,
+    #[arg(skip)]
+    packages: Vec<PackageFile>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -45,12 +49,20 @@ struct PluginRequest {
 struct PluginSection {
     cmdline: Option<String>,
     #[serde(default)]
+    dtb: Option<PathBuf>,
+    #[serde(default)]
     packages: Vec<PluginPackage>,
 }
 
 #[derive(Debug, Deserialize)]
 struct PluginPackage {
     source: Option<PluginSource>,
+    to: String,
+}
+
+#[derive(Debug)]
+struct PackageFile {
+    source: PathBuf,
     to: String,
 }
 
@@ -136,6 +148,7 @@ fn read_request() -> Result<PluginRequest, String> {
 
 impl PluginRequest {
     fn into_cli(self) -> Result<Cli, String> {
+        let packages = self.section.extra_packages()?;
         let initramfs = self
             .initramfs
             .or_else(|| self.section.initramfs_from_packages())
@@ -144,12 +157,14 @@ impl PluginRequest {
             arch: self.arch,
             kernel: self.kernel_elf,
             initramfs,
+            dtb: self.section.dtb,
             output: self.output,
             cmdline: self.section.cmdline,
             image_slack_mb: 32,
             boot_image_size_mb: None,
             limine_version: DEFAULT_LIMINE_VERSION.to_string(),
             cache_dir: None,
+            packages,
         })
     }
 }
@@ -163,6 +178,30 @@ impl PluginSection {
                 None
             }
         })
+    }
+
+    fn extra_packages(&self) -> Result<Vec<PackageFile>, String> {
+        self.packages
+            .iter()
+            .filter(|package| package.to != "/boot/initramfs")
+            .map(|package| {
+                let source = package
+                    .source
+                    .as_ref()
+                    .ok_or_else(|| format!("Limine boot package {} has no source", package.to))?
+                    .path()
+                    .ok_or_else(|| {
+                        format!(
+                            "Limine boot package {} must use a local file source",
+                            package.to
+                        )
+                    })?;
+                Ok(PackageFile {
+                    source,
+                    to: fat_destination(&package.to)?,
+                })
+            })
+            .collect()
     }
 }
 
@@ -181,6 +220,17 @@ impl PluginSource {
 fn build_limine_image(cli: &Cli) -> Result<(), String> {
     require_file(&cli.kernel)?;
     require_file(&cli.initramfs)?;
+    if let Some(dtb) = cli.dtb.as_deref() {
+        require_file(dtb)?;
+    }
+    for package in &cli.packages {
+        require_file(&package.source).map_err(|error| {
+            format!(
+                "Limine boot package for {} is invalid: {error}",
+                package.to.trim_start_matches("::")
+            )
+        })?;
+    }
     require_command("curl")?;
     require_command("git")?;
     require_command("mformat")?;
@@ -210,14 +260,22 @@ fn build_limine_image(cli: &Cli) -> Result<(), String> {
         .map_err(|error| format!("failed to create {}: {error}", work_dir.display()))?;
     let config_path = work_dir.join(format!("limine-{}.conf", cli.arch.name()));
     let cmdline = cli.cmdline.as_deref().or(spec.default_cmdline);
-    let limine_config = limine_config(&spec, cmdline);
+    let limine_config = limine_config(&spec, cmdline, cli.dtb.as_deref());
     fs::write(&config_path, limine_config)
         .map_err(|error| format!("failed to write {}: {error}", config_path.display()))?;
 
+    let dtb_size = cli.dtb.as_deref().map(file_size).transpose()?.unwrap_or(0);
+    let package_bytes = cli
+        .packages
+        .iter()
+        .map(|package| file_size(&package.source))
+        .try_fold(0u64, |total, size| size.map(|size| total + size))?;
     let payload_bytes = file_size(&boot_efi)?
         + file_size(&config_path)?
         + file_size(&cli.kernel)?
-        + file_size(&cli.initramfs)?;
+        + file_size(&cli.initramfs)?
+        + dtb_size
+        + package_bytes;
     let required_image_size_mb =
         align_up_mb(payload_bytes + cli.image_slack_mb * 1024 * 1024).max(MIN_UEFI_IMAGE_SIZE_MB);
     let image_size_mb = cli
@@ -245,6 +303,45 @@ fn build_limine_image(cli: &Cli) -> Result<(), String> {
         "mcopy",
         &["-i", esp_image_str, path_str(&boot_efi)?, &efi_destination],
     )?;
+
+    if let Some(dtb) = &cli.dtb {
+        run(
+            "mcopy",
+            &[
+                "-i",
+                esp_image_str,
+                path_str(dtb)?,
+                "::/boot/device-tree.dtb",
+            ],
+        )?;
+    }
+
+    let mut package_dirs = std::collections::BTreeSet::new();
+    for package in &cli.packages {
+        let parent = Path::new(&package.to)
+            .parent()
+            .ok_or_else(|| format!("invalid Limine boot package destination: {}", package.to))?;
+        let mut current = PathBuf::new();
+        for component in parent.components() {
+            current.push(component.as_os_str());
+            if current != Path::new("::")
+                && current != Path::new("::/EFI")
+                && current != Path::new("::/EFI/BOOT")
+                && current != Path::new("::/boot")
+            {
+                package_dirs.insert(current.clone());
+            }
+        }
+    }
+    for directory in package_dirs {
+        run("mmd", &["-i", esp_image_str, path_str(&directory)?])?;
+    }
+    for package in &cli.packages {
+        run(
+            "mcopy",
+            &["-i", esp_image_str, path_str(&package.source)?, &package.to],
+        )?;
+    }
     run(
         "mcopy",
         &[
@@ -304,11 +401,14 @@ fn esp_mtools_path(image: &Path) -> Result<String, String> {
     Ok(path_str(image)?.to_string())
 }
 
-fn limine_config(spec: &ArchSpec, cmdline: Option<&str>) -> String {
+fn limine_config(spec: &ArchSpec, cmdline: Option<&str>, dtb: Option<&Path>) -> String {
     let mut config = format!(
         "timeout: 0\nserial: no\nverbose: no\n\n/{}\n    protocol: limine\n    path: boot():/boot/kernel\n    module_path: boot():/boot/{}\n    module_string: initramfs\n{}",
         spec.menu_name, spec.initramfs_name, spec.extra_config
     );
+    if dtb.is_some() {
+        config.push_str("    dtb_path: boot():/boot/device-tree.dtb\n");
+    }
     if let Some(cmdline) = cmdline {
         config.push_str("    cmdline: ");
         config.push_str(cmdline);
@@ -428,6 +528,24 @@ fn file_size(path: &Path) -> Result<u64, String> {
         .len())
 }
 
+fn fat_destination(destination: &str) -> Result<String, String> {
+    let path = Path::new(destination);
+    if !path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir | std::path::Component::CurDir
+            )
+        })
+        || path.file_name().is_none()
+    {
+        return Err(format!(
+            "Limine boot package destination must be an absolute file path: {destination}"
+        ));
+    }
+    Ok(format!("::{}", path.display()))
+}
+
 fn align_up_mb(bytes: u64) -> u64 {
     let mb = bytes.div_ceil(1024 * 1024);
     mb.div_ceil(16) * 16
@@ -435,7 +553,9 @@ fn align_up_mb(bytes: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Parser};
+    use std::path::Path;
+
+    use super::{Arch, Cli, Parser, PluginRequest, fat_destination, limine_config};
 
     #[test]
     fn cli_uses_vhe_capable_limine_by_default() {
@@ -457,5 +577,106 @@ mod tests {
 
         // Then: the selected Limine release contains AArch64 EL2/VHE boot support.
         assert_eq!(cli.limine_version, "12.4.0");
+    }
+
+    #[test]
+    fn cli_parses_optional_dtb() {
+        let cli = Cli::try_parse_from([
+            "cargo-scarlet-plugin-limine",
+            "--arch",
+            "aarch64",
+            "--kernel",
+            "kernel.elf",
+            "--initramfs",
+            "initramfs.cpio",
+            "--dtb",
+            "board.dtb",
+            "--output",
+            "scarlet.img",
+        ])
+        .unwrap();
+        assert_eq!(cli.dtb.as_deref(), Some(Path::new("board.dtb")));
+    }
+
+    #[test]
+    fn limine_config_only_uses_dtb_path_for_full_dtb() {
+        assert!(!limine_config(&Arch::Aarch64.spec(), None, None).contains("dtb_path"));
+        assert!(
+            limine_config(&Arch::Aarch64.spec(), None, Some(Path::new("board.dtb")))
+                .contains("dtb_path: boot():/boot/device-tree.dtb")
+        );
+    }
+
+    #[test]
+    fn plugin_request_passes_full_dtb_to_cli() {
+        let request: PluginRequest = serde_json::from_str(
+            r#"{
+                "arch": "aarch64",
+                "kernel_elf": "kernel.elf",
+                "initramfs": "initramfs.cpio",
+                "output": "scarlet.img",
+                "section": { "dtb": "board.dtb", "packages": [] }
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            request.into_cli().unwrap().dtb.as_deref(),
+            Some(Path::new("board.dtb"))
+        );
+    }
+
+    #[test]
+    fn plugin_request_maps_extra_package_to_fat_path() {
+        let request: PluginRequest = serde_json::from_str(
+            r#"{
+                "arch": "aarch64",
+                "kernel_elf": "kernel.elf",
+                "initramfs": "initramfs.cpio",
+                "output": "scarlet.img",
+                "section": {
+                    "packages": [
+                        { "source": "apple-avd.dtbo", "to": "/boot/apple-avd.dtbo" }
+                    ]
+                }
+            }"#,
+        )
+        .unwrap();
+        let cli = request.into_cli().unwrap();
+        assert_eq!(cli.packages[0].to, "::/boot/apple-avd.dtbo");
+    }
+
+    #[test]
+    fn package_destination_requires_absolute_file_path() {
+        assert!(fat_destination("boot/apple-avd.dtbo").is_err());
+        assert!(fat_destination("/boot/../apple-avd.dtbo").is_err());
+        assert!(fat_destination("/").is_err());
+        assert_eq!(
+            fat_destination("/boot/apple-avd.dtbo").unwrap(),
+            "::/boot/apple-avd.dtbo"
+        );
+    }
+
+    #[test]
+    fn plugin_request_rejects_non_local_extra_package_source() {
+        let request: PluginRequest = serde_json::from_str(
+            r#"{
+                "arch": "aarch64",
+                "kernel_elf": "kernel.elf",
+                "initramfs": "initramfs.cpio",
+                "output": "scarlet.img",
+                "section": {
+                    "packages": [
+                        { "source": { "git": "https://example.invalid/overlay.git" }, "to": "/boot/apple-avd.dtbo" }
+                    ]
+                }
+            }"#,
+        )
+        .unwrap();
+        assert!(
+            request
+                .into_cli()
+                .unwrap_err()
+                .contains("local file source")
+        );
     }
 }

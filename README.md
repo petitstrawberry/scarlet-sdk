@@ -34,6 +34,18 @@ Image generation uses external filesystem and disk-image tools:
 
 Use `format = "ext2"` and `format = "limine-uefi"` to build partition payload images, then `format = "gpt"` to compose those payloads into a GPT disk image. `format = "gpt-ext2"` remains available for simple one-partition root images. GPT partition tables are written through the Rust `gpt` crate.
 
+### Limine boot files
+
+`limine-uefi` supports an optional full `dtb` path for platforms that must replace the firmware device tree. Local `copy` layers on the boot image are also copied into the FAT image at their absolute `to` path:
+
+```toml
+[[images.boot.layers]]
+kind = "copy"
+source = ".scarlet/board.dtbo"
+to = "/boot/board.dtbo"
+```
+
+The copy source must be a regular local file. The initramfs remains a dedicated Limine payload and is not copied a second time through this mechanism.
 
 ### Bundle layers
 

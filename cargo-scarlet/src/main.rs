@@ -254,6 +254,8 @@ struct ManifestImageSection {
     #[serde(default)]
     cmdline: String,
     #[serde(default)]
+    dtb: Option<String>,
+    #[serde(default)]
     layers: Vec<ManifestLayer>,
     #[serde(default)]
     deps: Vec<String>,
@@ -342,6 +344,8 @@ struct PluginRequest<'a> {
 #[derive(Serialize)]
 struct PluginRequestSection {
     cmdline: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    dtb: Option<String>,
     packages: Vec<PluginRequestPackage>,
 }
 
@@ -2216,30 +2220,19 @@ fn build_manifest_image(
                     initramfs_path_from_layers(project, &expanded.manifest.images, resolved)
                         .unwrap_or_else(|| project.join(".scarlet/images/initramfs.cpio"));
 
-                let mut limine_hasher = Sha256::new();
-                limine_hasher.update(b"format=limine-uefi\n");
-                limine_hasher.update(format!("cmdline={}\n", section_cfg.cmdline).as_bytes());
-                if kernel_elf.exists() {
-                    limine_hasher.update(
-                        format!(
-                            "kernel:{}:{}\n",
-                            kernel_elf.display(),
-                            sha256_file(&kernel_elf)?
-                        )
-                        .as_bytes(),
-                    );
-                }
-                if initramfs_path.exists() {
-                    limine_hasher.update(
-                        format!(
-                            "initramfs:{}:{}\n",
-                            initramfs_path.display(),
-                            sha256_file(&initramfs_path)?
-                        )
-                        .as_bytes(),
-                    );
-                }
-                let limine_hash = format!("sha256:{}", hex::encode(limine_hasher.finalize()));
+                let dtb_path = section_cfg
+                    .dtb
+                    .as_deref()
+                    .map(|dtb| resolve_path(project, dtb));
+                let packages =
+                    plugin_packages_from_layers(project, &expanded.manifest.images, resolved)?;
+                let limine_hash = limine_image_hash(
+                    &section_cfg.cmdline,
+                    &kernel_elf,
+                    &initramfs_path,
+                    dtb_path.as_deref(),
+                    &packages,
+                )?;
 
                 let existing_section_lock = existing_lock.sections.get(&section_name);
                 if image_output_is_current(
@@ -2273,11 +2266,8 @@ fn build_manifest_image(
                     output: output_path.display().to_string(),
                     section: PluginRequestSection {
                         cmdline: Some(section_cfg.cmdline.clone()),
-                        packages: plugin_packages_from_layers(
-                            project,
-                            &expanded.manifest.images,
-                            resolved,
-                        )?,
+                        dtb: dtb_path.as_ref().map(|path| path.display().to_string()),
+                        packages,
                     },
                 };
                 run_plugin("limine", &request)?;
@@ -2399,6 +2389,61 @@ fn image_content_hash(format: &str, staging_hash: &str) -> String {
     hasher.update(format!("format={format}\n").as_bytes());
     hasher.update(format!("staging={staging_hash}\n").as_bytes());
     format!("sha256:{}", hex::encode(hasher.finalize()))
+}
+
+fn limine_image_hash(
+    cmdline: &str,
+    kernel_elf: &Path,
+    initramfs_path: &Path,
+    dtb_path: Option<&Path>,
+    packages: &[PluginRequestPackage],
+) -> Result<String, String> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"format=limine-uefi\n");
+    hasher.update(format!("cmdline={cmdline}\n").as_bytes());
+    if kernel_elf.exists() {
+        hasher.update(
+            format!(
+                "kernel:{}:{}\n",
+                kernel_elf.display(),
+                sha256_file(kernel_elf)?
+            )
+            .as_bytes(),
+        );
+    }
+    if initramfs_path.exists() {
+        hasher.update(
+            format!(
+                "initramfs:{}:{}\n",
+                initramfs_path.display(),
+                sha256_file(initramfs_path)?
+            )
+            .as_bytes(),
+        );
+    }
+    if let Some(dtb_path) = dtb_path {
+        hasher
+            .update(format!("dtb:{}:{}\n", dtb_path.display(), sha256_file(dtb_path)?).as_bytes());
+    }
+    for package in packages {
+        let source = Path::new(&package.source);
+        if !source.is_file() {
+            return Err(format!(
+                "Limine boot package source must be a file: {}",
+                source.display()
+            ));
+        }
+        hasher.update(
+            format!(
+                "package:{}:{}:{}\n",
+                package.to,
+                source.display(),
+                sha256_file(source)?
+            )
+            .as_bytes(),
+        );
+    }
+    Ok(format!("sha256:{}", hex::encode(hasher.finalize())))
 }
 
 fn image_output_is_current(
@@ -3035,7 +3080,9 @@ fn plugin_packages_from_layers(
     for layer in &section.layers {
         match layer {
             ResolvedLayer::Copy(file) => {
-                if let FileSource::Local(source) = &file.source {
+                if file.to != "/boot/initramfs"
+                    && let FileSource::Local(source) = &file.source
+                {
                     packages.push(PluginRequestPackage {
                         source: source.display().to_string(),
                         to: file.to.clone(),
@@ -5217,6 +5264,71 @@ to = "/"
             },
             _ => panic!("expected second layer to be project copy"),
         }
+
+        fs::remove_dir_all(&temp).unwrap();
+    }
+
+    #[test]
+    fn limine_hash_includes_extra_package_destination_source_and_contents() {
+        let temp = std::env::temp_dir().join(format!(
+            "cargo-scarlet-limine-package-hash-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&temp);
+        fs::create_dir_all(&temp).unwrap();
+        let kernel = temp.join("kernel.elf");
+        let initramfs = temp.join("initramfs.cpio");
+        let overlay = temp.join("apple-avd.dtbo");
+        fs::write(&kernel, b"kernel").unwrap();
+        fs::write(&initramfs, b"initramfs").unwrap();
+        fs::write(&overlay, b"first overlay").unwrap();
+
+        let package = PluginRequestPackage {
+            source: overlay.display().to_string(),
+            to: "/boot/apple-avd.dtbo".to_string(),
+        };
+        let first = limine_image_hash("", &kernel, &initramfs, None, &[package]).unwrap();
+        fs::write(&overlay, b"changed overlay").unwrap();
+        let changed_contents = limine_image_hash(
+            "",
+            &kernel,
+            &initramfs,
+            None,
+            &[PluginRequestPackage {
+                source: overlay.display().to_string(),
+                to: "/boot/apple-avd.dtbo".to_string(),
+            }],
+        )
+        .unwrap();
+        assert_ne!(first, changed_contents);
+
+        let changed_destination = limine_image_hash(
+            "",
+            &kernel,
+            &initramfs,
+            None,
+            &[PluginRequestPackage {
+                source: overlay.display().to_string(),
+                to: "/boot/avd.dtbo".to_string(),
+            }],
+        )
+        .unwrap();
+        assert_ne!(changed_contents, changed_destination);
+
+        let copied_overlay = temp.join("copied.dtbo");
+        fs::write(&copied_overlay, b"changed overlay").unwrap();
+        let changed_source = limine_image_hash(
+            "",
+            &kernel,
+            &initramfs,
+            None,
+            &[PluginRequestPackage {
+                source: copied_overlay.display().to_string(),
+                to: "/boot/avd.dtbo".to_string(),
+            }],
+        )
+        .unwrap();
+        assert_ne!(changed_destination, changed_source);
 
         fs::remove_dir_all(&temp).unwrap();
     }
