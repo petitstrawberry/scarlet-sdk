@@ -277,7 +277,14 @@ struct ManifestGptPartition {
 #[serde(tag = "kind", rename_all = "kebab-case")]
 enum ManifestLayer {
     Bundle {
-        path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<PackageSource>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subdir: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bundle: Option<String>,
     },
     Copy {
         source: String,
@@ -1021,6 +1028,49 @@ fn git_current_rev(dir: &Path) -> Result<String, String> {
     Ok(rev[..40].to_string())
 }
 
+fn resolve_git_source(
+    source: &PackageSource,
+    cache_dir: &Path,
+    locked_rev: Option<String>,
+) -> Result<(PathBuf, String), String> {
+    let PackageSource::Git {
+        git,
+        branch,
+        tag,
+        rev,
+    } = source
+    else {
+        return Err("source is not a git source".to_string());
+    };
+
+    let resolved_rev = if let Some(rev) = locked_rev {
+        eprintln!("cargo-scarlet: using locked {} -> {rev}", git);
+        rev
+    } else {
+        let refspec = rev
+            .as_deref()
+            .or(tag.as_deref())
+            .or(branch.as_deref())
+            .unwrap_or("HEAD");
+        let resolved_rev = if is_full_git_commit_id(refspec) {
+            refspec.to_string()
+        } else {
+            git_resolve_rev(git, refspec)?
+        };
+        eprintln!(
+            "cargo-scarlet: resolved {} {} -> {resolved_rev}",
+            git, refspec
+        );
+        resolved_rev
+    };
+    let checkout_dir = git_ensure_checkout(git, &resolved_rev, cache_dir)?;
+    Ok((checkout_dir, resolved_rev))
+}
+
+fn is_full_git_commit_id(revision: &str) -> bool {
+    revision.len() == 40 && revision.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 fn resolve_git_sources(
     expanded: &mut ExpandedManifest,
     project: &Path,
@@ -1029,46 +1079,24 @@ fn resolve_git_sources(
     let cache_dir = project.join(".scarlet/cache/git");
     for (section_name, section) in expanded.sections.iter_mut() {
         for pkg in section.packages_mut() {
-            if let Some(PackageSource::Git {
-                git,
-                branch,
-                tag,
-                rev,
-                ..
-            }) = &pkg.source
-            {
-                if pkg.local_source.is_some() {
-                    continue;
-                }
-                let url = git.clone();
-
-                let locked_rev = existing_lock
-                    .sections
-                    .get(section_name)
-                    .and_then(|s| {
-                        s.package_locks()
-                            .find(|p| package_lock_matches_input(project, p, pkg).unwrap_or(false))
-                    })
-                    .and_then(|p| p.resolved_rev.clone());
-
-                let resolved_rev = if let Some(rev) = locked_rev {
-                    eprintln!("cargo-scarlet: using locked {} -> {rev}", url);
-                    rev
-                } else {
-                    let refspec = rev
-                        .as_deref()
-                        .or(tag.as_deref())
-                        .or(branch.as_deref())
-                        .unwrap_or("HEAD")
-                        .to_string();
-                    let r = git_resolve_rev(&url, &refspec)?;
-                    eprintln!("cargo-scarlet: resolved {} {} -> {r}", url, refspec);
-                    r
-                };
-                let checkout_dir = git_ensure_checkout(&url, &resolved_rev, &cache_dir)?;
-                pkg.local_source = Some(checkout_dir);
-                pkg.resolved_rev = Some(resolved_rev);
+            let Some(source @ PackageSource::Git { .. }) = pkg.source.as_ref() else {
+                continue;
+            };
+            if pkg.local_source.is_some() {
+                continue;
             }
+
+            let locked_rev = existing_lock
+                .sections
+                .get(section_name)
+                .and_then(|s| {
+                    s.package_locks()
+                        .find(|p| package_lock_matches_input(project, p, pkg).unwrap_or(false))
+                })
+                .and_then(|p| p.resolved_rev.clone());
+            let (checkout_dir, resolved_rev) = resolve_git_source(source, &cache_dir, locked_rev)?;
+            pkg.local_source = Some(checkout_dir);
+            pkg.resolved_rev = Some(resolved_rev);
         }
     }
     Ok(())
@@ -1137,8 +1165,41 @@ fn resolve_layers(
     images: &BTreeMap<String, ManifestImageSection>,
 ) -> Result<Vec<ResolvedLayer>, String> {
     let mut resolved = Vec::new();
-    resolve_layers_into(&mut resolved, layers, base_dir, ctx, images)?;
+    let git_cache_dir = base_dir.join(".scarlet/cache/git");
+    resolve_layers_into(&mut resolved, layers, base_dir, ctx, images, &git_cache_dir)?;
     Ok(resolved)
+}
+
+fn resolve_bundle_path(
+    path: Option<&str>,
+    source: Option<&PackageSource>,
+    subdir: Option<&str>,
+    bundle: Option<&str>,
+    base_dir: &Path,
+    git_cache_dir: &Path,
+) -> Result<PathBuf, String> {
+    match source {
+        Some(source @ PackageSource::Git { .. }) => {
+            let (checkout_dir, _) = resolve_git_source(source, git_cache_dir, None)
+                .map_err(|error| format!("failed to resolve git bundle source: {error}"))?;
+            let subdir = Path::new(subdir.unwrap_or(""));
+            let bundle = Path::new(bundle.unwrap_or("bundle.toml"));
+            if subdir.is_absolute() || bundle.is_absolute() {
+                return Err(
+                    "git bundle source subdir and bundle must be relative to the checkout root"
+                        .to_string(),
+                );
+            }
+            Ok(checkout_dir.join(subdir).join(bundle))
+        }
+        Some(_) => Err(
+            "bundle layer source must be a git source; use path for a local bundle file"
+                .to_string(),
+        ),
+        None => path
+            .map(|path| resolve_path(base_dir, path))
+            .ok_or_else(|| "bundle layer requires path or a git source".to_string()),
+    }
 }
 
 fn resolve_layers_into(
@@ -1147,18 +1208,41 @@ fn resolve_layers_into(
     base_dir: &Path,
     ctx: &TemplateContext,
     images: &BTreeMap<String, ManifestImageSection>,
+    git_cache_dir: &Path,
 ) -> Result<(), String> {
     for layer in layers {
         match layer {
-            ManifestLayer::Bundle { path } => {
-                let bundle_path = resolve_path(base_dir, &ctx.expand(path));
+            ManifestLayer::Bundle {
+                path,
+                source,
+                subdir,
+                bundle,
+            } => {
+                let path = path.as_deref().map(|path| ctx.expand(path));
+                let subdir = subdir.as_deref().map(|subdir| ctx.expand(subdir));
+                let bundle = bundle.as_deref().map(|bundle| ctx.expand(bundle));
+                let bundle_path = resolve_bundle_path(
+                    path.as_deref(),
+                    source.as_ref(),
+                    subdir.as_deref(),
+                    bundle.as_deref(),
+                    base_dir,
+                    git_cache_dir,
+                )?;
                 let bundle_dir = bundle_path.parent().unwrap_or(Path::new("."));
                 let text = fs::read_to_string(&bundle_path)
                     .map_err(|e| format!("failed to read bundle {}: {e}", bundle_path.display()))?;
                 let bundle: BundleManifest = toml::from_str(&text).map_err(|e| {
                     format!("failed to parse bundle {}: {e}", bundle_path.display())
                 })?;
-                resolve_layers_into(resolved, &bundle.layers, bundle_dir, ctx, images)?;
+                resolve_layers_into(
+                    resolved,
+                    &bundle.layers,
+                    bundle_dir,
+                    ctx,
+                    images,
+                    git_cache_dir,
+                )?;
             }
             ManifestLayer::Copy {
                 source,
@@ -4618,10 +4702,16 @@ to = "/system/scarlet/bin/video_player"
 
         let layers = vec![
             ManifestLayer::Bundle {
-                path: "bundles/desktop/bundle.toml".to_string(),
+                path: Some("bundles/desktop/bundle.toml".to_string()),
+                source: None,
+                subdir: None,
+                bundle: None,
             },
             ManifestLayer::Bundle {
-                path: "bundles/experimental/bundle.toml".to_string(),
+                path: Some("bundles/experimental/bundle.toml".to_string()),
+                source: None,
+                subdir: None,
+                bundle: None,
             },
         ];
         let ctx = TemplateContext {
@@ -4984,6 +5074,98 @@ to = "/system/scarlet/bin/video_player"
     }
 
     #[test]
+    fn git_bundle_source_recursively_expands_nested_layers() {
+        fn run_git(dir: &Path, args: &[&str]) {
+            let status = Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed in {}", dir.display());
+        }
+
+        let temp = std::env::temp_dir().join(format!(
+            "cargo-scarlet-git-bundle-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&temp);
+        let project = temp.join("project");
+        let repo = temp.join("bundle-repo");
+        fs::create_dir_all(repo.join("bundles/base/fs")).unwrap();
+        fs::create_dir_all(repo.join("bundles/desktop")).unwrap();
+        fs::create_dir_all(&project).unwrap();
+        fs::write(repo.join("bundles/base/fs/.keep"), "").unwrap();
+        fs::write(
+            repo.join("bundles/base/bundle.toml"),
+            r#"
+[[layers]]
+kind = "copy"
+source = "fs"
+to = "/"
+"#,
+        )
+        .unwrap();
+        fs::write(
+            repo.join("bundles/desktop/bundle.toml"),
+            r#"
+[[layers]]
+kind = "bundle"
+path = "../base/bundle.toml"
+"#,
+        )
+        .unwrap();
+        run_git(&repo, &["init", "--quiet"]);
+        run_git(&repo, &["config", "user.email", "test@example.com"]);
+        run_git(&repo, &["config", "user.name", "cargo-scarlet test"]);
+        run_git(&repo, &["add", "."]);
+        run_git(&repo, &["commit", "--quiet", "-m", "bundle test"]);
+        let revision = String::from_utf8(
+            Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&repo)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+
+        let manifest = format!(
+            r#"
+[[layers]]
+kind = "bundle"
+source = {{ git = "{}", rev = "{}" }}
+subdir = "bundles/desktop"
+"#,
+            repo.display(),
+            revision.trim()
+        );
+        let bundle: BundleManifest = toml::from_str(&manifest).unwrap();
+        let ctx = TemplateContext {
+            arch: "aarch64".to_string(),
+            target_triple: "aarch64-unknown-none-elf".to_string(),
+            project: "test".to_string(),
+        };
+        let images = BTreeMap::new();
+
+        let resolved = resolve_layers(&bundle.layers, &project, &ctx, &images).unwrap();
+        assert_eq!(resolved.len(), 1);
+        match &resolved[0] {
+            ResolvedLayer::Copy(ResolvedFile {
+                source: FileSource::Local(path),
+                ..
+            }) => {
+                let path = fs::canonicalize(path).unwrap();
+                let git_cache_dir = fs::canonicalize(project.join(".scarlet/cache/git")).unwrap();
+                assert!(path.starts_with(git_cache_dir));
+                assert!(path.ends_with(Path::new("bundles/base/fs")));
+            }
+            _ => panic!("expected copy layer from nested git bundle"),
+        }
+
+        fs::remove_dir_all(&temp).unwrap();
+    }
+
+    #[test]
     fn bundle_layer_expands_in_place() {
         let temp = std::env::temp_dir().join(format!("cargo-scarlet-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&temp);
@@ -5001,7 +5183,10 @@ to = "/"
 
         let layers = vec![
             ManifestLayer::Bundle {
-                path: "bundle/bundle.toml".to_string(),
+                path: Some("bundle/bundle.toml".to_string()),
+                source: None,
+                subdir: None,
+                bundle: None,
             },
             ManifestLayer::Copy {
                 source: "rootfs".to_string(),

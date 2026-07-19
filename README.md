@@ -34,6 +34,28 @@ Image generation uses external filesystem and disk-image tools:
 
 Use `format = "ext2"` and `format = "limine-uefi"` to build partition payload images, then `format = "gpt"` to compose those payloads into a GPT disk image. `format = "gpt-ext2"` remains available for simple one-partition root images. GPT partition tables are written through the Rust `gpt` crate.
 
+
+### Bundle layers
+
+Bundle layers expand reusable `bundle.toml` layer lists recursively. Existing local paths remain supported:
+
+```toml
+[[images.rootfs.layers]]
+kind = "bundle"
+path = "bundles/desktop/bundle.toml"
+```
+
+Bundles can also be fetched from a Git repository. The checkout is cached under
+`.scarlet/cache/git`; use a pinned revision for reproducible builds. `subdir` is
+relative to the checkout root, and `bundle` defaults to `bundle.toml`.
+
+```toml
+[[images.rootfs.layers]]
+kind = "bundle"
+source = { git = "https://github.com/petitstrawberry/Scarlet", rev = "<commit-sha>" }
+subdir = "bundles/desktop"
+```
+
 Example:
 
 ```toml
