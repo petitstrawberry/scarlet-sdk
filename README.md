@@ -34,19 +34,6 @@ Image generation uses external filesystem and disk-image tools:
 
 Use `format = "ext2"` and `format = "limine-uefi"` to build partition payload images, then `format = "gpt"` to compose those payloads into a GPT disk image. `format = "gpt-ext2"` remains available for simple one-partition root images. GPT partition tables are written through the Rust `gpt` crate.
 
-### Limine UEFI device tree
-
-A `limine-uefi` image section can optionally provide a full device tree blob relative to the Scarlet project directory:
-
-```toml
-[images.boot]
-format = "limine-uefi"
-output = ".scarlet/images/boot.img"
-dtb = "boards/my-board.dtb"
-```
-
-When `dtb` is set, Limine uses `boot():/boot/device-tree.dtb` instead of the firmware-provided device tree. Provide one fully merged, flattened DTB; DT overlays are not supported.
-
 Example:
 
 ```toml
