@@ -5122,6 +5122,14 @@ to = "/system/scarlet/bin/video_player"
 
     #[test]
     fn git_bundle_source_recursively_expands_nested_layers() {
+        if !Command::new("git")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success())
+        {
+            eprintln!("skipping: git binary not available");
+            return;
+        }
         fn run_git(dir: &Path, args: &[&str]) {
             let status = Command::new("git")
                 .args(args)
