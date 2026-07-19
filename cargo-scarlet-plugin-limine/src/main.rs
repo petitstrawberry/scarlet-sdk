@@ -19,6 +19,8 @@ struct Cli {
     #[arg(long)]
     initramfs: PathBuf,
     #[arg(long)]
+    dtb: Option<PathBuf>,
+    #[arg(long)]
     output: PathBuf,
     #[arg(long)]
     cmdline: Option<String>,
@@ -44,6 +46,8 @@ struct PluginRequest {
 #[derive(Debug, Default, Deserialize)]
 struct PluginSection {
     cmdline: Option<String>,
+    #[serde(default)]
+    dtb: Option<PathBuf>,
     #[serde(default)]
     packages: Vec<PluginPackage>,
 }
@@ -144,6 +148,7 @@ impl PluginRequest {
             arch: self.arch,
             kernel: self.kernel_elf,
             initramfs,
+            dtb: self.section.dtb,
             output: self.output,
             cmdline: self.section.cmdline,
             image_slack_mb: 32,
@@ -181,6 +186,9 @@ impl PluginSource {
 fn build_limine_image(cli: &Cli) -> Result<(), String> {
     require_file(&cli.kernel)?;
     require_file(&cli.initramfs)?;
+    if let Some(dtb) = cli.dtb.as_deref() {
+        require_file(dtb)?;
+    }
     require_command("curl")?;
     require_command("git")?;
     require_command("mformat")?;
@@ -210,14 +218,19 @@ fn build_limine_image(cli: &Cli) -> Result<(), String> {
         .map_err(|error| format!("failed to create {}: {error}", work_dir.display()))?;
     let config_path = work_dir.join(format!("limine-{}.conf", cli.arch.name()));
     let cmdline = cli.cmdline.as_deref().or(spec.default_cmdline);
-    let limine_config = limine_config(&spec, cmdline);
+    let limine_config = limine_config(&spec, cmdline, cli.dtb.as_deref());
     fs::write(&config_path, limine_config)
         .map_err(|error| format!("failed to write {}: {error}", config_path.display()))?;
 
+    let dtb_size = match cli.dtb.as_deref() {
+        Some(dtb) => file_size(dtb)?,
+        None => 0,
+    };
     let payload_bytes = file_size(&boot_efi)?
         + file_size(&config_path)?
         + file_size(&cli.kernel)?
-        + file_size(&cli.initramfs)?;
+        + file_size(&cli.initramfs)?
+        + dtb_size;
     let required_image_size_mb =
         align_up_mb(payload_bytes + cli.image_slack_mb * 1024 * 1024).max(MIN_UEFI_IMAGE_SIZE_MB);
     let image_size_mb = cli
@@ -275,6 +288,18 @@ fn build_limine_image(cli: &Cli) -> Result<(), String> {
         ],
     )?;
 
+    if let Some(dtb) = &cli.dtb {
+        run(
+            "mcopy",
+            &[
+                "-i",
+                esp_image_str,
+                path_str(dtb)?,
+                "::/boot/device-tree.dtb",
+            ],
+        )?;
+    }
+
     let startup = work_dir.join("startup.nsh");
     fs::write(&startup, format!("FS0:\n{}\n", spec.startup_path))
         .map_err(|error| format!("failed to write {}: {error}", startup.display()))?;
@@ -304,11 +329,14 @@ fn esp_mtools_path(image: &Path) -> Result<String, String> {
     Ok(path_str(image)?.to_string())
 }
 
-fn limine_config(spec: &ArchSpec, cmdline: Option<&str>) -> String {
+fn limine_config(spec: &ArchSpec, cmdline: Option<&str>, dtb: Option<&Path>) -> String {
     let mut config = format!(
         "timeout: 0\nserial: no\nverbose: no\n\n/{}\n    protocol: limine\n    path: boot():/boot/kernel\n    module_path: boot():/boot/{}\n    module_string: initramfs\n{}",
         spec.menu_name, spec.initramfs_name, spec.extra_config
     );
+    if dtb.is_some() {
+        config.push_str("    dtb_path: boot():/boot/device-tree.dtb\n");
+    }
     if let Some(cmdline) = cmdline {
         config.push_str("    cmdline: ");
         config.push_str(cmdline);
@@ -435,7 +463,9 @@ fn align_up_mb(bytes: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Parser};
+    use std::path::Path;
+
+    use super::{Arch, Cli, Parser, PluginRequest, limine_config};
 
     #[test]
     fn cli_uses_vhe_capable_limine_by_default() {
@@ -457,5 +487,93 @@ mod tests {
 
         // Then: the selected Limine release contains AArch64 EL2/VHE boot support.
         assert_eq!(cli.limine_version, "12.4.0");
+    }
+
+    #[test]
+    fn cli_parses_optional_dtb() {
+        let args = [
+            "cargo-scarlet-plugin-limine",
+            "--arch",
+            "riscv64",
+            "--kernel",
+            "kernel.elf",
+            "--initramfs",
+            "initramfs.cpio",
+            "--dtb",
+            "boards/full.dtb",
+            "--output",
+            "scarlet.img",
+        ];
+
+        let cli = Cli::try_parse_from(args).expect("the test CLI arguments should parse");
+
+        assert_eq!(cli.dtb.as_deref(), Some(Path::new("boards/full.dtb")));
+    }
+
+    #[test]
+    fn limine_config_omits_dtb_path_without_dtb() {
+        let config = limine_config(&Arch::Riscv64.spec(), None, None);
+
+        assert_eq!(
+            config
+                .matches("    dtb_path: boot():/boot/device-tree.dtb\n")
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn limine_config_includes_one_dtb_path_with_dtb() {
+        let config = limine_config(
+            &Arch::Riscv64.spec(),
+            None,
+            Some(Path::new("boards/full.dtb")),
+        );
+
+        assert_eq!(
+            config
+                .matches("    dtb_path: boot():/boot/device-tree.dtb\n")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn old_plugin_request_without_dtb_deserializes() {
+        let request: PluginRequest = serde_json::from_str(
+            r#"{
+                "arch": "riscv64",
+                "kernel_elf": "kernel.elf",
+                "initramfs": "initramfs.cpio",
+                "output": "scarlet.img",
+                "section": { "cmdline": null, "packages": [] }
+            }"#,
+        )
+        .expect("the legacy plugin request should deserialize");
+
+        assert!(request.section.dtb.is_none());
+    }
+
+    #[test]
+    fn plugin_request_passes_dtb_to_cli() {
+        let request: PluginRequest = serde_json::from_str(
+            r#"{
+                "arch": "riscv64",
+                "kernel_elf": "kernel.elf",
+                "initramfs": "initramfs.cpio",
+                "output": "scarlet.img",
+                "section": {
+                    "cmdline": null,
+                    "dtb": "boards/full.dtb",
+                    "packages": []
+                }
+            }"#,
+        )
+        .expect("the plugin request with a DTB should deserialize");
+
+        let cli = request
+            .into_cli()
+            .expect("the plugin request with an initramfs should convert to CLI options");
+        assert_eq!(cli.dtb.as_deref(), Some(Path::new("boards/full.dtb")));
     }
 }
