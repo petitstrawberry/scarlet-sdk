@@ -310,7 +310,7 @@ enum ManifestLayer {
     },
     Archive {
         url: String,
-        sha256: String,
+        sha256: Sha256Spec,
         format: ArchiveFormat,
         #[serde(default)]
         strip_components: usize,
@@ -347,6 +347,27 @@ enum ArchiveFormat {
     TarGz,
     TarZst,
     TarXz,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(untagged)]
+pub(crate) enum Sha256Spec {
+    Single(String),
+    PerArch(BTreeMap<String, String>),
+}
+
+impl Sha256Spec {
+    fn resolve(&self, arch: &str) -> Result<String, String> {
+        match self {
+            Sha256Spec::Single(s) => Ok(s.clone()),
+            Sha256Spec::PerArch(map) => map.get(arch).cloned().ok_or_else(|| {
+                format!(
+                    "archive layer sha256 map is missing entry for arch '{arch}'; have: {}",
+                    map.keys().cloned().collect::<Vec<_>>().join(", ")
+                )
+            }),
+        }
+    }
 }
 
 struct ResolvedSection {
@@ -1300,6 +1321,10 @@ struct TemplateContext {
 }
 
 impl TemplateContext {
+    fn arch(&self) -> &str {
+        &self.arch
+    }
+
     fn expand(&self, s: &str) -> String {
         s.replace("{target_triple}", &self.target_triple)
             .replace("{arch}", &self.arch)
@@ -1486,7 +1511,9 @@ fn resolve_layers_into(
                 to,
             } => {
                 let url = ctx.expand(url);
-                let sha256 = normalize_sha256(sha256)
+                let sha256 = sha256
+                    .resolve(ctx.arch())
+                    .and_then(|sha256| normalize_sha256(&sha256))
                     .map_err(|error| format!("archive layer {url}: {error}"))?;
                 resolved.push(ResolvedLayer::Archive(ResolvedArchive {
                     url,
@@ -3248,6 +3275,31 @@ fn remove_existing_path(path: &Path) -> Result<(), String> {
     }
 }
 
+fn fetch_url_to_path(url: &str, dest: &Path) -> Result<(), String> {
+    if let Some(rest) = url.strip_prefix("file://") {
+        let source = Path::new(rest);
+        fs::copy(source, dest).map_err(|e| {
+            format!(
+                "failed to copy file:// URL {url} to {}: {e}",
+                dest.display()
+            )
+        })?;
+        return Ok(());
+    }
+
+    let dest_str = dest
+        .to_str()
+        .ok_or_else(|| format!("destination path is not UTF-8: {}", dest.display()))?;
+    let status = Command::new("curl")
+        .args(["-fsSL", "-o", dest_str, url])
+        .status()
+        .map_err(|e| format!("failed to run curl: {e}"))?;
+    if !status.success() {
+        return Err(format!("curl failed to fetch {url}"));
+    }
+    Ok(())
+}
+
 fn fetch_url_cached(
     url: &str,
     cache_dir: &Path,
@@ -3268,13 +3320,9 @@ fn fetch_url_cached(
             .map_err(|e| format!("failed to create cache dir {}: {e}", cache_dir.display()))?;
 
         eprintln!("cargo-scarlet: fetching {}", url);
-        let status = Command::new("curl")
-            .args(["-fsSL", "-o", cached_path.to_str().unwrap_or(""), url])
-            .status()
-            .map_err(|e| format!("failed to run curl: {e}"))?;
-        if !status.success() {
+        if let Err(e) = fetch_url_to_path(url, &cached_path) {
             let _ = fs::remove_file(&cached_path);
-            return Err(format!("curl failed to fetch {}", url));
+            return Err(e);
         }
     }
 
@@ -3352,22 +3400,11 @@ fn fetch_archive_by_sha256(
         )
     })?;
     let temporary_path = cache_dir.join(format!(".{hash}.tmp-{}", std::process::id()));
-    let temporary_path_string = temporary_path.to_str().ok_or_else(|| {
-        format!(
-            "archive cache path is not UTF-8: {}",
-            temporary_path.display()
-        )
-    })?;
 
-    let status = Command::new("curl")
-        .args(["-fsSL", "-o", temporary_path_string, url])
-        .status()
-        .map_err(|error| format!("failed to run curl: {error}"))?;
-    if !status.success() {
+    if let Err(e) = fetch_url_to_path(url, &temporary_path) {
         let _ = fs::remove_file(&temporary_path);
-        return Err(format!("curl failed to fetch {url}"));
+        return Err(e);
     }
-
     let actual_sha256 = sha256_file(&temporary_path)?;
     if actual_sha256 != expected_sha256 {
         let _ = fs::remove_file(&temporary_path);
@@ -6263,6 +6300,107 @@ to = "/system"
         ));
         let serialized = toml::to_string(&layer).unwrap();
         assert!(serialized.contains("format = \"tar-zst\""));
+    }
+
+    #[test]
+    fn test_archive_layer_accepts_single_sha256() {
+        let hash = "aa".repeat(32);
+        let layer: ManifestLayer = toml::from_str(&format!(
+            r#"
+kind = "archive"
+url = "https://example.com/rootfs.tar.zst"
+sha256 = "sha256:{hash}"
+format = "tar-zst"
+to = "/system"
+"#,
+        ))
+        .unwrap();
+        let ManifestLayer::Archive { sha256, .. } = layer else {
+            panic!("expected archive layer");
+        };
+
+        assert_eq!(sha256.resolve("aarch64").unwrap(), format!("sha256:{hash}"));
+    }
+
+    #[test]
+    fn test_archive_layer_accepts_per_arch_sha256_map() {
+        let aarch64_hash = "aa".repeat(32);
+        let riscv64_hash = "bb".repeat(32);
+        let layer: ManifestLayer = toml::from_str(&format!(
+            r#"
+kind = "archive"
+url = "https://example.com/rootfs.tar.zst"
+sha256 = {{ aarch64 = "sha256:{aarch64_hash}", riscv64 = "sha256:{riscv64_hash}" }}
+format = "tar-zst"
+to = "/system"
+"#,
+        ))
+        .unwrap();
+        let ManifestLayer::Archive { sha256, .. } = layer else {
+            panic!("expected archive layer");
+        };
+
+        assert_eq!(
+            sha256.resolve("aarch64").unwrap(),
+            format!("sha256:{aarch64_hash}")
+        );
+        assert_eq!(
+            sha256.resolve("riscv64").unwrap(),
+            format!("sha256:{riscv64_hash}")
+        );
+    }
+
+    #[test]
+    fn test_archive_layer_per_arch_missing_entry_errors() {
+        let sha256 = Sha256Spec::PerArch(BTreeMap::from([(
+            "aarch64".to_string(),
+            format!("sha256:{}", "aa".repeat(32)),
+        )]));
+
+        let error = sha256.resolve("riscv64").unwrap_err();
+        assert!(error.contains("missing entry for arch 'riscv64'"));
+        assert!(error.contains("have: aarch64"));
+    }
+
+    #[test]
+    fn test_archive_layer_per_arch_extras_ignored() {
+        let aarch64_hash = format!("sha256:{}", "aa".repeat(32));
+        let sha256 = Sha256Spec::PerArch(BTreeMap::from([
+            ("aarch64".to_string(), aarch64_hash.clone()),
+            ("x86_64".to_string(), format!("sha256:{}", "bb".repeat(32))),
+        ]));
+
+        assert_eq!(sha256.resolve("aarch64").unwrap(), aarch64_hash);
+    }
+
+    #[test]
+    fn test_archive_layer_lock_serializes_resolved_sha256() {
+        let aarch64_hash = "aa".repeat(32);
+        let riscv64_hash = "bb".repeat(32);
+        let layers = vec![ManifestLayer::Archive {
+            url: "https://example.com/rootfs-{arch}.tar.zst".to_string(),
+            sha256: Sha256Spec::PerArch(BTreeMap::from([
+                ("aarch64".to_string(), format!("sha256:{aarch64_hash}")),
+                ("riscv64".to_string(), format!("sha256:{riscv64_hash}")),
+            ])),
+            format: ArchiveFormat::TarZst,
+            strip_components: 0,
+            to: "/system".to_string(),
+        }];
+        let ctx = TemplateContext {
+            arch: "aarch64".to_string(),
+            target_triple: "aarch64-unknown-none-elf".to_string(),
+            project: "test".to_string(),
+        };
+        let resolved = resolve_layers(&layers, Path::new("."), &ctx, &BTreeMap::new()).unwrap();
+        let [ResolvedLayer::Archive(archive)] = resolved.as_slice() else {
+            panic!("expected resolved archive layer");
+        };
+
+        let lock_toml = toml::to_string(&archive_lock(archive)).unwrap();
+        assert!(lock_toml.contains(&format!("sha256:{aarch64_hash}")));
+        assert!(!lock_toml.contains(&riscv64_hash));
+        assert!(!lock_toml.contains("riscv64"));
     }
 
     #[test]

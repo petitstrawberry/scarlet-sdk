@@ -67,6 +67,7 @@
             cargo-scarlet-plugin-limine
             pkgs.git
             pkgs.pkg-config
+            pkgs.curl
           ]
           ++ imageTools;
           cargo-scarlet = rustPlatform.buildRustPackage {
@@ -76,7 +77,7 @@
             buildAndTestSubdir = "cargo-scarlet";
             cargoLock.lockFile = ./Cargo.lock;
             nativeBuildInputs = [ pkgs.makeWrapper ];
-            nativeCheckInputs = imageTools;
+            nativeCheckInputs = imageTools ++ [ pkgs.curl ];
             postInstall = ''
               wrapProgram "$out/bin/cargo-scarlet" \
                 --prefix PATH : ${pkgs.lib.makeBinPath cargoScarletRuntimeTools} \
