@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 
 use clap::{Parser, Subcommand};
@@ -31,6 +31,10 @@ enum Commands {
         module: Option<PathBuf>,
         #[arg(long)]
         output: Option<PathBuf>,
+        #[arg(long)]
+        locked: bool,
+        #[arg(long)]
+        offline: bool,
     },
     Check {
         #[arg(long)]
@@ -59,6 +63,10 @@ enum Commands {
         release: bool,
         #[arg(long)]
         no_image: bool,
+        #[arg(long)]
+        locked: bool,
+        #[arg(long)]
+        offline: bool,
         #[arg(last = true)]
         extra_args: Vec<String>,
     },
@@ -73,6 +81,10 @@ enum Commands {
         kernel_elf: Option<PathBuf>,
         #[arg(long)]
         no_build: bool,
+        #[arg(long)]
+        locked: bool,
+        #[arg(long)]
+        offline: bool,
     },
     New {
         #[arg(long)]
@@ -89,6 +101,8 @@ enum Commands {
     Update {
         #[arg(long)]
         project: PathBuf,
+        #[arg(long)]
+        offline: bool,
     },
 }
 
@@ -294,6 +308,14 @@ enum ManifestLayer {
         #[serde(default)]
         template: bool,
     },
+    Archive {
+        url: String,
+        sha256: String,
+        format: ArchiveFormat,
+        #[serde(default)]
+        strip_components: usize,
+        to: String,
+    },
     Cargo {
         source: PackageSource,
         package: Option<String>,
@@ -316,6 +338,15 @@ enum ManifestLayer {
         source: String,
         to: String,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum ArchiveFormat {
+    Tar,
+    TarGz,
+    TarZst,
+    TarXz,
 }
 
 struct ResolvedSection {
@@ -420,6 +451,15 @@ enum LayerLock {
         template: bool,
         hash: String,
     },
+    Archive {
+        source: LockPackageSource,
+        #[serde(default)]
+        to: String,
+        format: ArchiveFormat,
+        #[serde(default)]
+        strip_components: usize,
+        hash: String,
+    },
     Cargo {
         #[serde(skip_serializing_if = "Option::is_none")]
         source: Option<LockPackageSource>,
@@ -469,6 +509,7 @@ enum LockPackageSource {
 enum StructuredPackageSource {
     Path { path: String },
     Git { url: String, rev: String },
+    Archive { url: String, sha256: String },
 }
 
 impl LockPackageSource {
@@ -478,6 +519,10 @@ impl LockPackageSource {
 
     fn git(url: String, rev: String) -> Self {
         Self::Structured(StructuredPackageSource::Git { url, rev })
+    }
+
+    fn archive(url: String, sha256: String) -> Self {
+        Self::Structured(StructuredPackageSource::Archive { url, sha256 })
     }
 }
 
@@ -531,7 +576,7 @@ impl SectionLock {
                     output: output.clone(),
                     hash: hash.clone(),
                 }),
-                LayerLock::Copy { .. } => None,
+                LayerLock::Copy { .. } | LayerLock::Archive { .. } => None,
             }))
     }
 
@@ -645,6 +690,86 @@ fn copy_lock_matches_input(lock: &FileLock, file: &ResolvedFile) -> bool {
     }
 }
 
+fn archive_lock_matches_input(lock: &LayerLock, archive: &ResolvedArchive) -> bool {
+    let LayerLock::Archive {
+        source,
+        to,
+        format,
+        strip_components,
+        hash,
+    } = lock
+    else {
+        return false;
+    };
+    let LockPackageSource::Structured(StructuredPackageSource::Archive { url, sha256 }) = source
+    else {
+        return false;
+    };
+
+    url == &archive.url
+        && to == &archive.to
+        && format == &archive.format
+        && strip_components == &archive.strip_components
+        && normalize_sha256(sha256).ok().as_deref() == Some(archive.sha256.as_str())
+        && normalize_sha256(hash).ok().as_deref() == Some(archive.sha256.as_str())
+}
+
+fn archive_lock_matches_destination(lock: &LayerLock, to: &str) -> bool {
+    matches!(lock, LayerLock::Archive { to: lock_to, .. } if lock_to == to)
+}
+
+fn validate_locked_archive_layers(
+    expanded: &ExpandedManifest,
+    existing_lock: &ImageLock,
+) -> Result<(), String> {
+    for (section_name, section) in &expanded.sections {
+        let section_lock = existing_lock.sections.get(section_name);
+        for archive in section.layers.iter().filter_map(|layer| match layer {
+            ResolvedLayer::Archive(archive) => Some(archive),
+            _ => None,
+        }) {
+            let locks = section_lock
+                .map(|lock| lock.layers.as_slice())
+                .unwrap_or(&[]);
+            let has_destination = locks
+                .iter()
+                .any(|lock| archive_lock_matches_destination(lock, &archive.to));
+            let has_identity = locks.iter().any(|lock| {
+                matches!(
+                    lock,
+                    LayerLock::Archive {
+                        source: LockPackageSource::Structured(StructuredPackageSource::Archive { url, .. }),
+                        to,
+                        ..
+                    } if url == &archive.url && to == &archive.to
+                )
+            });
+
+            if !has_identity {
+                let state = if has_destination {
+                    "differs"
+                } else {
+                    "is missing"
+                };
+                return Err(format!(
+                    "--locked: archive layer {} in section {} {state} from scarlet.lock; run `cargo scarlet update`",
+                    archive.url, section_name
+                ));
+            }
+            if !locks
+                .iter()
+                .any(|lock| archive_lock_matches_input(lock, archive))
+            {
+                return Err(format!(
+                    "--locked: archive layer {} in section {} differs from scarlet.lock; run `cargo scarlet update`",
+                    archive.url, section_name
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn package_input_lock(
     project: &Path,
     pkg: &ResolvedPackage,
@@ -723,8 +848,17 @@ struct PackageLayerSpec {
 #[allow(clippy::large_enum_variant)]
 enum ResolvedLayer {
     Copy(ResolvedFile),
+    Archive(ResolvedArchive),
     Package(ResolvedPackage),
     Image { source: String, to: String },
+}
+
+struct ResolvedArchive {
+    url: String,
+    sha256: String,
+    format: ArchiveFormat,
+    strip_components: usize,
+    to: String,
 }
 
 impl ResolvedSection {
@@ -974,22 +1108,44 @@ fn project_cargo_target_dir(project: &Path) -> PathBuf {
     project.join(".scarlet/cache/target")
 }
 
-fn git_ensure_checkout(url: &str, rev: &str, cache_base: &Path) -> Result<PathBuf, String> {
+fn git_ensure_checkout(
+    url: &str,
+    rev: &str,
+    cache_base: &Path,
+    offline: bool,
+) -> Result<PathBuf, String> {
     let dir = git_cache_dir_for_url(url, cache_base);
     if dir.join(".git").exists() {
         let head_rev = git_current_rev(&dir)?;
         if head_rev == rev {
             return Ok(dir);
         }
-        let status = Command::new("git")
-            .arg("fetch")
-            .arg("origin")
-            .current_dir(&dir)
-            .status()
-            .map_err(|e| format!("git fetch failed: {e}"))?;
-        if !status.success() {
-            return Err(format!("git fetch failed in {}", dir.display()));
+        if offline {
+            let output = Command::new("git")
+                .args(["rev-parse", "--verify", &format!("{rev}^{{commit}}")])
+                .current_dir(&dir)
+                .output()
+                .map_err(|error| format!("failed to inspect cached git source: {error}"))?;
+            if !output.status.success() {
+                return Err(format!(
+                    "--offline: cached git source {url} does not contain revision {rev}"
+                ));
+            }
+        } else {
+            let status = Command::new("git")
+                .arg("fetch")
+                .arg("origin")
+                .current_dir(&dir)
+                .status()
+                .map_err(|e| format!("git fetch failed: {e}"))?;
+            if !status.success() {
+                return Err(format!("git fetch failed in {}", dir.display()));
+            }
         }
+    } else if offline {
+        return Err(format!(
+            "--offline: git source {url} is not present in .scarlet/cache/git"
+        ));
     } else {
         if let Some(parent) = dir.parent() {
             fs::create_dir_all(parent).map_err(|e| format!("failed to create cache dir: {e}"))?;
@@ -1016,6 +1172,32 @@ fn git_ensure_checkout(url: &str, rev: &str, cache_base: &Path) -> Result<PathBu
     Ok(dir)
 }
 
+fn git_resolve_cached_rev(url: &str, refspec: &str, cache_base: &Path) -> Result<String, String> {
+    let dir = git_cache_dir_for_url(url, cache_base);
+    if !dir.join(".git").exists() {
+        return Err(format!(
+            "--offline: git source {url} is not present in .scarlet/cache/git"
+        ));
+    }
+    let output = Command::new("git")
+        .args(["rev-parse", "--verify", &format!("{refspec}^{{commit}}")])
+        .current_dir(&dir)
+        .output()
+        .map_err(|error| format!("failed to inspect cached git source: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "--offline: cached git source {url} does not contain reference {refspec}"
+        ));
+    }
+    let rev = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if !is_full_git_commit_id(&rev) {
+        return Err(format!(
+            "--offline: cached git source {url} resolved invalid revision {rev}"
+        ));
+    }
+    Ok(rev)
+}
+
 fn git_current_rev(dir: &Path) -> Result<String, String> {
     let output = Command::new("git")
         .args(["rev-parse", "HEAD"])
@@ -1036,6 +1218,7 @@ fn resolve_git_source(
     source: &PackageSource,
     cache_dir: &Path,
     locked_rev: Option<String>,
+    offline: bool,
 ) -> Result<(PathBuf, String), String> {
     let PackageSource::Git {
         git,
@@ -1058,6 +1241,8 @@ fn resolve_git_source(
             .unwrap_or("HEAD");
         let resolved_rev = if is_full_git_commit_id(refspec) {
             refspec.to_string()
+        } else if offline {
+            git_resolve_cached_rev(git, refspec, cache_dir)?
         } else {
             git_resolve_rev(git, refspec)?
         };
@@ -1067,7 +1252,7 @@ fn resolve_git_source(
         );
         resolved_rev
     };
-    let checkout_dir = git_ensure_checkout(git, &resolved_rev, cache_dir)?;
+    let checkout_dir = git_ensure_checkout(git, &resolved_rev, cache_dir, offline)?;
     Ok((checkout_dir, resolved_rev))
 }
 
@@ -1079,6 +1264,7 @@ fn resolve_git_sources(
     expanded: &mut ExpandedManifest,
     project: &Path,
     existing_lock: &ImageLock,
+    offline: bool,
 ) -> Result<(), String> {
     let cache_dir = project.join(".scarlet/cache/git");
     for (section_name, section) in expanded.sections.iter_mut() {
@@ -1098,7 +1284,8 @@ fn resolve_git_sources(
                         .find(|p| package_lock_matches_input(project, p, pkg).unwrap_or(false))
                 })
                 .and_then(|p| p.resolved_rev.clone());
-            let (checkout_dir, resolved_rev) = resolve_git_source(source, &cache_dir, locked_rev)?;
+            let (checkout_dir, resolved_rev) =
+                resolve_git_source(source, &cache_dir, locked_rev, offline)?;
             pkg.local_source = Some(checkout_dir);
             pkg.resolved_rev = Some(resolved_rev);
         }
@@ -1157,20 +1344,40 @@ fn resolve_section(
     base_dir: &Path,
     ctx: &TemplateContext,
     images: &BTreeMap<String, ManifestImageSection>,
+    offline: bool,
 ) -> Result<ResolvedSection, String> {
-    let layers = resolve_layers(&section.layers, base_dir, ctx, images)?;
+    let layers = resolve_layers_with_offline(&section.layers, base_dir, ctx, images, offline)?;
     Ok(ResolvedSection { layers })
 }
 
+#[cfg(test)]
 fn resolve_layers(
     layers: &[ManifestLayer],
     base_dir: &Path,
     ctx: &TemplateContext,
     images: &BTreeMap<String, ManifestImageSection>,
 ) -> Result<Vec<ResolvedLayer>, String> {
+    resolve_layers_with_offline(layers, base_dir, ctx, images, false)
+}
+
+fn resolve_layers_with_offline(
+    layers: &[ManifestLayer],
+    base_dir: &Path,
+    ctx: &TemplateContext,
+    images: &BTreeMap<String, ManifestImageSection>,
+    offline: bool,
+) -> Result<Vec<ResolvedLayer>, String> {
     let mut resolved = Vec::new();
     let git_cache_dir = base_dir.join(".scarlet/cache/git");
-    resolve_layers_into(&mut resolved, layers, base_dir, ctx, images, &git_cache_dir)?;
+    resolve_layers_into(
+        &mut resolved,
+        layers,
+        base_dir,
+        ctx,
+        images,
+        &git_cache_dir,
+        offline,
+    )?;
     Ok(resolved)
 }
 
@@ -1181,10 +1388,11 @@ fn resolve_bundle_path(
     bundle: Option<&str>,
     base_dir: &Path,
     git_cache_dir: &Path,
+    offline: bool,
 ) -> Result<PathBuf, String> {
     match source {
         Some(source @ PackageSource::Git { .. }) => {
-            let (checkout_dir, _) = resolve_git_source(source, git_cache_dir, None)
+            let (checkout_dir, _) = resolve_git_source(source, git_cache_dir, None, offline)
                 .map_err(|error| format!("failed to resolve git bundle source: {error}"))?;
             let subdir = Path::new(subdir.unwrap_or(""));
             let bundle = Path::new(bundle.unwrap_or("bundle.toml"));
@@ -1213,6 +1421,7 @@ fn resolve_layers_into(
     ctx: &TemplateContext,
     images: &BTreeMap<String, ManifestImageSection>,
     git_cache_dir: &Path,
+    offline: bool,
 ) -> Result<(), String> {
     for layer in layers {
         match layer {
@@ -1232,6 +1441,7 @@ fn resolve_layers_into(
                     bundle.as_deref(),
                     base_dir,
                     git_cache_dir,
+                    offline,
                 )?;
                 let bundle_dir = bundle_path.parent().unwrap_or(Path::new("."));
                 let text = fs::read_to_string(&bundle_path)
@@ -1246,6 +1456,7 @@ fn resolve_layers_into(
                     ctx,
                     images,
                     git_cache_dir,
+                    offline,
                 )?;
             }
             ManifestLayer::Copy {
@@ -1265,6 +1476,24 @@ fn resolve_layers_into(
                     source,
                     to: ctx.expand(to),
                     template: *template,
+                }));
+            }
+            ManifestLayer::Archive {
+                url,
+                sha256,
+                format,
+                strip_components,
+                to,
+            } => {
+                let url = ctx.expand(url);
+                let sha256 = normalize_sha256(sha256)
+                    .map_err(|error| format!("archive layer {url}: {error}"))?;
+                resolved.push(ResolvedLayer::Archive(ResolvedArchive {
+                    url,
+                    sha256,
+                    format: format.clone(),
+                    strip_components: *strip_components,
+                    to: ctx.expand(to),
                 }));
             }
             ManifestLayer::Cargo {
@@ -1333,7 +1562,10 @@ fn resolve_layers_into(
     Ok(())
 }
 
-fn expand_manifest(project_dir: &Path) -> Result<ExpandedManifest, String> {
+fn expand_manifest_with_offline(
+    project_dir: &Path,
+    offline: bool,
+) -> Result<ExpandedManifest, String> {
     let manifest = load_manifest(project_dir)?;
     let bsp = manifest_bsp_config(&manifest, project_dir)?;
     let target_triple = target_triple_from_build_target(&bsp.build_target)?;
@@ -1355,7 +1587,7 @@ fn expand_manifest(project_dir: &Path) -> Result<ExpandedManifest, String> {
     for (name, section) in images_ref {
         sections.insert(
             name.clone(),
-            resolve_section(section, project_dir, &ctx, images_ref)?,
+            resolve_section(section, project_dir, &ctx, images_ref, offline)?,
         );
     }
 
@@ -1367,7 +1599,14 @@ fn expand_manifest(project_dir: &Path) -> Result<ExpandedManifest, String> {
 }
 
 fn generate_from_manifest(project_dir: &Path) -> Result<ExpandedManifest, String> {
-    let expanded = expand_manifest(project_dir)?;
+    generate_from_manifest_with_offline(project_dir, false)
+}
+
+fn generate_from_manifest_with_offline(
+    project_dir: &Path,
+    offline: bool,
+) -> Result<ExpandedManifest, String> {
+    let expanded = expand_manifest_with_offline(project_dir, offline)?;
 
     let generated_root = project_dir.join(".scarlet/scarlet-modules");
     let generated_src = generated_root.join("src");
@@ -1513,6 +1752,21 @@ fn sha256_file(path: &Path) -> Result<String, String> {
     Ok(format!("sha256:{}", hex::encode(hasher.finalize())))
 }
 
+fn normalize_sha256(input: &str) -> Result<String, String> {
+    let hex = input.strip_prefix("sha256:").unwrap_or(input);
+    if hex.len() != 64 {
+        return Err(format!(
+            "invalid SHA-256 '{input}': expected 64 hexadecimal characters"
+        ));
+    }
+    if !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(format!(
+            "invalid SHA-256 '{input}': expected only hexadecimal characters"
+        ));
+    }
+    Ok(format!("sha256:{}", hex.to_ascii_lowercase()))
+}
+
 fn sha256_dir(dir: &Path) -> Result<String, String> {
     let mut hasher = Sha256::new();
     sha256_dir_recursive(dir, &mut hasher)?;
@@ -1576,8 +1830,8 @@ fn sha256_dir_recursive(dir: &Path, hasher: &mut Sha256) -> Result<(), String> {
     Ok(())
 }
 
-fn cmd_update(project: &Path) -> Result<(), String> {
-    let mut expanded = expand_manifest(project)?;
+fn cmd_update(project: &Path, offline: bool) -> Result<(), String> {
+    let mut expanded = expand_manifest_with_offline(project, offline)?;
     let git_cache_dir = project.join(".scarlet/cache/git");
     let file_cache_dir = project.join(".scarlet/cache/files");
     let mut lock = load_lock(project);
@@ -1587,11 +1841,7 @@ fn cmd_update(project: &Path) -> Result<(), String> {
             if let Some(ref src) = pkg.source
                 && src.is_git()
             {
-                let url = src.git_url().unwrap();
-                let refspec = src.git_ref().unwrap_or_else(|| "HEAD".to_string());
-                let rev = git_resolve_rev(url, &refspec)?;
-                eprintln!("cargo-scarlet: resolved {} {} -> {rev}", url, refspec);
-                let checkout = git_ensure_checkout(url, &rev, &git_cache_dir)?;
+                let (checkout, rev) = resolve_git_source(src, &git_cache_dir, None, offline)?;
                 pkg.local_source = Some(checkout);
                 pkg.resolved_rev = Some(rev.clone());
             }
@@ -1625,8 +1875,12 @@ fn cmd_update(project: &Path) -> Result<(), String> {
                                     .find(|lock| lock.source == *url)
                             })
                             .map(|lock| lock.hash);
-                        let (_, hash) =
-                            fetch_url_cached(url, &file_cache_dir, previous_hash.as_deref())?;
+                        let (_, hash) = fetch_url_cached_with_offline(
+                            url,
+                            &file_cache_dir,
+                            previous_hash.as_deref(),
+                            offline,
+                        )?;
                         layers.push(LayerLock::Copy {
                             source: url.clone(),
                             to: file.to.clone(),
@@ -1634,6 +1888,24 @@ fn cmd_update(project: &Path) -> Result<(), String> {
                             hash,
                         });
                     }
+                }
+                ResolvedLayer::Archive(archive) => {
+                    fetch_archive_by_sha256(
+                        &archive.url,
+                        &archive.sha256,
+                        &file_cache_dir,
+                        offline,
+                    )?;
+                    layers.push(LayerLock::Archive {
+                        source: LockPackageSource::archive(
+                            archive.url.clone(),
+                            archive.sha256.clone(),
+                        ),
+                        to: archive.to.clone(),
+                        format: archive.format.clone(),
+                        strip_components: archive.strip_components,
+                        hash: archive.sha256.clone(),
+                    });
                 }
                 ResolvedLayer::Package(pkg) => {
                     let previous_hash =
@@ -1695,6 +1967,8 @@ fn run() -> Result<(), String> {
             release,
             module,
             output,
+            locked,
+            offline,
         } => {
             if let Some(module_path) = module {
                 build_loadable_module(&module_path, target.as_deref(), output.as_deref(), release)?;
@@ -1702,7 +1976,10 @@ fn run() -> Result<(), String> {
             } else {
                 let project = project.ok_or("--project is required when not using --module")?;
                 let project = normalize_project_path(&project)?;
-                let expanded = generate_from_manifest(&project)?;
+                let expanded = generate_from_manifest_with_offline(&project, offline)?;
+                if locked {
+                    validate_locked_archive_layers(&expanded, &load_lock(&project))?;
+                }
                 cargo_build_manifest(
                     &project,
                     &expanded,
@@ -1736,13 +2013,18 @@ fn run() -> Result<(), String> {
             target,
             release,
             no_image,
+            locked,
+            offline,
             extra_args,
         } => {
             let project = normalize_project_path(&project)?;
-            let expanded = generate_from_manifest(&project)?;
+            let expanded = generate_from_manifest_with_offline(&project, offline)?;
+            if locked {
+                validate_locked_archive_layers(&expanded, &load_lock(&project))?;
+            }
 
             if !no_image {
-                build_manifest_image(&project, target, release, None, false)?;
+                build_manifest_image(&project, target, release, None, false, locked, offline)?;
             }
 
             match &expanded.manifest.runner {
@@ -1781,9 +2063,13 @@ fn run() -> Result<(), String> {
             release,
             kernel_elf,
             no_build,
+            locked,
+            offline,
         } => {
             let project = normalize_project_path(&project)?;
-            build_manifest_image(&project, target, release, kernel_elf, no_build)
+            build_manifest_image(
+                &project, target, release, kernel_elf, no_build, locked, offline,
+            )
         }
         Commands::New {
             module,
@@ -1798,9 +2084,9 @@ fn run() -> Result<(), String> {
             kernel_rev.as_deref(),
             target.as_deref(),
         ),
-        Commands::Update { project } => {
+        Commands::Update { project, offline } => {
             let project = normalize_project_path(&project)?;
-            cmd_update(&project)
+            cmd_update(&project, offline)
         }
     }
 }
@@ -1981,8 +2267,14 @@ fn build_manifest_image(
     release: bool,
     kernel_elf: Option<PathBuf>,
     no_build: bool,
+    locked: bool,
+    offline: bool,
 ) -> Result<(), String> {
-    let mut expanded = generate_from_manifest(project)?;
+    let mut expanded = generate_from_manifest_with_offline(project, offline)?;
+    let existing_lock = load_lock(project);
+    if locked {
+        validate_locked_archive_layers(&expanded, &existing_lock)?;
+    }
 
     if !no_build {
         cargo_build_manifest(project, &expanded, target.as_deref(), release, "build", &[])?;
@@ -2033,8 +2325,7 @@ fn build_manifest_image(
 
     let build_order = topo_sort_images(&expanded.manifest.images)?;
 
-    let existing_lock = load_lock(project);
-    resolve_git_sources(&mut expanded, project, &existing_lock)?;
+    resolve_git_sources(&mut expanded, project, &existing_lock, offline)?;
     let mut new_lock = ImageLock::default();
 
     for section_name in build_order {
@@ -2080,6 +2371,16 @@ fn build_manifest_image(
                                 &cache_dir,
                                 prev_section_lock,
                                 &tpl_ctx,
+                                offline,
+                                &mut layer_locks,
+                            )?;
+                        }
+                        ResolvedLayer::Archive(archive) => {
+                            apply_archive_layer(
+                                archive,
+                                &staging_dir,
+                                &cache_dir,
+                                offline,
                                 &mut layer_locks,
                             )?;
                         }
@@ -2990,12 +3291,433 @@ fn fetch_url_cached(
     Ok((cached_path, actual_hash))
 }
 
+fn cached_url_path(url: &str, cache_dir: &Path) -> PathBuf {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    url.hash(&mut hasher);
+    let hash = format!("{:016x}", hasher.finish());
+    let url_path = url.split('?').next().unwrap_or(url);
+    let basename = url_path.rsplit('/').next().unwrap_or("download");
+    cache_dir.join(format!("{}-{}", &hash[..12], basename))
+}
+
+fn fetch_url_cached_with_offline(
+    url: &str,
+    cache_dir: &Path,
+    expected_hash: Option<&str>,
+    offline: bool,
+) -> Result<(PathBuf, String), String> {
+    let cached_path = cached_url_path(url, cache_dir);
+    if offline && !cached_path.exists() {
+        return Err(format!(
+            "--offline: file {url} is not present in .scarlet/cache/files"
+        ));
+    }
+    fetch_url_cached(url, cache_dir, expected_hash)
+}
+
+fn fetch_archive_by_sha256(
+    url: &str,
+    expected_sha256: &str,
+    cache_dir: &Path,
+    offline: bool,
+) -> Result<PathBuf, String> {
+    let expected_sha256 = normalize_sha256(expected_sha256)?;
+    let hash = expected_sha256
+        .strip_prefix("sha256:")
+        .ok_or("normalized SHA-256 is missing sha256: prefix")?;
+    let cached_path = cache_dir.join(hash);
+
+    if cached_path.exists() {
+        let actual_sha256 = sha256_file(&cached_path)?;
+        if actual_sha256 != expected_sha256 {
+            return Err(format!(
+                "archive SHA-256 mismatch for {url}: expected {expected_sha256}, got {actual_sha256}"
+            ));
+        }
+        return Ok(cached_path);
+    }
+
+    if offline {
+        return Err(format!(
+            "--offline: archive {expected_sha256} is not present in .scarlet/cache/files; run without --offline or run `cargo scarlet update`"
+        ));
+    }
+
+    fs::create_dir_all(cache_dir).map_err(|error| {
+        format!(
+            "failed to create cache dir {}: {error}",
+            cache_dir.display()
+        )
+    })?;
+    let temporary_path = cache_dir.join(format!(".{hash}.tmp-{}", std::process::id()));
+    let temporary_path_string = temporary_path.to_str().ok_or_else(|| {
+        format!(
+            "archive cache path is not UTF-8: {}",
+            temporary_path.display()
+        )
+    })?;
+
+    let status = Command::new("curl")
+        .args(["-fsSL", "-o", temporary_path_string, url])
+        .status()
+        .map_err(|error| format!("failed to run curl: {error}"))?;
+    if !status.success() {
+        let _ = fs::remove_file(&temporary_path);
+        return Err(format!("curl failed to fetch {url}"));
+    }
+
+    let actual_sha256 = sha256_file(&temporary_path)?;
+    if actual_sha256 != expected_sha256 {
+        let _ = fs::remove_file(&temporary_path);
+        return Err(format!(
+            "archive SHA-256 mismatch for {url}: expected {expected_sha256}, got {actual_sha256}"
+        ));
+    }
+
+    fs::rename(&temporary_path, &cached_path).map_err(|error| {
+        format!(
+            "failed to move downloaded archive {} into {}: {error}",
+            temporary_path.display(),
+            cached_path.display()
+        )
+    })?;
+    Ok(cached_path)
+}
+
+fn archive_entry_relative_path(
+    path: &Path,
+    strip_components: usize,
+) -> Result<Option<PathBuf>, String> {
+    if path.is_absolute() {
+        return Err(format!("refusing absolute archive path {}", path.display()));
+    }
+
+    let mut clean = PathBuf::new();
+    for (index, component) in path.components().skip(strip_components).enumerate() {
+        match component {
+            Component::Normal(component) => clean.push(component),
+            Component::CurDir if index == 0 => {}
+            Component::CurDir => {
+                return Err(format!(
+                    "refusing archive path {} with embedded current-directory component",
+                    path.display()
+                ));
+            }
+            Component::ParentDir => {
+                return Err(format!("refusing archive path {} with ..", path.display()));
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(format!("refusing absolute archive path {}", path.display()));
+            }
+        }
+    }
+
+    if clean.as_os_str().is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(clean))
+    }
+}
+
+fn lexical_absolute_components(path: &Path) -> Option<Vec<std::ffi::OsString>> {
+    if !path.is_absolute() {
+        return None;
+    }
+
+    let mut components = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) => return None,
+            Component::RootDir | Component::CurDir => {}
+            Component::Normal(component) => components.push(component.to_os_string()),
+            Component::ParentDir => {
+                components.pop()?;
+            }
+        }
+    }
+    Some(components)
+}
+
+fn lexical_contains(root: &Path, target: &Path) -> bool {
+    let Some(root_components) = lexical_absolute_components(root) else {
+        return false;
+    };
+    let Some(target_components) = lexical_absolute_components(target) else {
+        return false;
+    };
+    target_components.starts_with(&root_components)
+}
+
+fn ensure_no_symlink_ancestors(dest_root: &Path, dest: &Path) -> Result<(), String> {
+    if !lexical_contains(dest_root, dest) {
+        return Err(format!(
+            "refusing archive path {} (escapes extraction root)",
+            dest.display()
+        ));
+    }
+
+    let relative = dest.strip_prefix(dest_root).map_err(|error| {
+        format!(
+            "failed to inspect archive destination {} below {}: {error}",
+            dest.display(),
+            dest_root.display()
+        )
+    })?;
+    let mut current = dest_root.to_path_buf();
+    check_not_symlink(&current)?;
+    for component in relative.components() {
+        current.push(component.as_os_str());
+        check_not_symlink(&current)?;
+    }
+    Ok(())
+}
+
+fn check_not_symlink(path: &Path) -> Result<(), String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(format!(
+            "refusing archive entry below symlink {}",
+            path.display()
+        )),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("failed to inspect {}: {error}", path.display())),
+    }
+}
+
+fn archive_symlink_target_path(
+    dest_root: &Path,
+    dest: &Path,
+    target: &Path,
+) -> Result<PathBuf, String> {
+    if target
+        .components()
+        .any(|component| matches!(component, Component::Prefix(_)))
+    {
+        return Err(format!(
+            "refusing symlink {} (escapes extraction root)",
+            target.display()
+        ));
+    }
+
+    if target.is_absolute() {
+        let mut resolved = dest_root.to_path_buf();
+        for component in target.components() {
+            match component {
+                Component::RootDir | Component::CurDir => {}
+                Component::Normal(component) => resolved.push(component),
+                Component::ParentDir => resolved.push(".."),
+                Component::Prefix(_) => unreachable!(),
+            }
+        }
+        Ok(resolved)
+    } else {
+        let parent = dest.parent().ok_or_else(|| {
+            format!(
+                "failed to determine parent directory for archive path {}",
+                dest.display()
+            )
+        })?;
+        Ok(parent.join(target))
+    }
+}
+
+fn extract_archive_entries<R: Read>(
+    archive: &mut tar::Archive<R>,
+    strip_components: usize,
+    dest_root: &Path,
+) -> Result<(), String> {
+    for entry in archive
+        .entries()
+        .map_err(|error| format!("failed to read archive entries: {error}"))?
+    {
+        let mut entry = entry.map_err(|error| format!("failed to read archive entry: {error}"))?;
+        let path = entry
+            .path()
+            .map_err(|error| format!("failed to read archive entry path: {error}"))?
+            .into_owned();
+        if entry.path_bytes().starts_with(b"/") {
+            return Err(format!("refusing absolute archive path {}", path.display()));
+        }
+        let Some(relative) = archive_entry_relative_path(&path, strip_components)? else {
+            continue;
+        };
+        let dest = dest_root.join(relative);
+        if !dest.starts_with(dest_root) || !lexical_contains(dest_root, &dest) {
+            return Err(format!(
+                "refusing archive path {} (escapes extraction root)",
+                path.display()
+            ));
+        }
+
+        let entry_type = entry.header().entry_type();
+        if entry_type.is_hard_link() {
+            return Err(format!(
+                "refusing hardlink archive entry {}",
+                path.display()
+            ));
+        }
+        if !entry_type.is_file() && !entry_type.is_dir() && !entry_type.is_symlink() {
+            return Err(format!("refusing special archive entry {}", path.display()));
+        }
+
+        if entry_type.is_file() {
+            let parent = dest.parent().ok_or_else(|| {
+                format!(
+                    "failed to determine parent directory for archive path {}",
+                    path.display()
+                )
+            })?;
+            fs::create_dir_all(parent)
+                .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
+            ensure_no_symlink_ancestors(dest_root, &dest)?;
+            let mut file = fs::File::create(&dest)
+                .map_err(|error| format!("failed to create {}: {error}", dest.display()))?;
+            std::io::copy(&mut entry, &mut file)
+                .map_err(|error| format!("failed to extract {}: {error}", path.display()))?;
+            let mode =
+                entry.header().mode().map_err(|error| {
+                    format!("failed to read mode for {}: {error}", path.display())
+                })? & (0o7777 & !0o7000);
+            fs::set_permissions(&dest, std::os::unix::fs::PermissionsExt::from_mode(mode))
+                .map_err(|error| {
+                    format!("failed to set permissions on {}: {error}", dest.display())
+                })?;
+        } else if entry_type.is_dir() {
+            ensure_no_symlink_ancestors(dest_root, &dest)?;
+            fs::create_dir_all(&dest)
+                .map_err(|error| format!("failed to create {}: {error}", dest.display()))?;
+            ensure_no_symlink_ancestors(dest_root, &dest)?;
+            let mode =
+                entry.header().mode().map_err(|error| {
+                    format!("failed to read mode for {}: {error}", path.display())
+                })? & (0o7777 & !0o7000);
+            fs::set_permissions(&dest, std::os::unix::fs::PermissionsExt::from_mode(mode))
+                .map_err(|error| {
+                    format!("failed to set permissions on {}: {error}", dest.display())
+                })?;
+        } else {
+            let target = entry
+                .link_name()
+                .map_err(|error| {
+                    format!(
+                        "failed to read symlink target for {}: {error}",
+                        path.display()
+                    )
+                })?
+                .ok_or_else(|| format!("archive symlink {} has no target", path.display()))?;
+            let resolved_target = archive_symlink_target_path(dest_root, &dest, target.as_ref())?;
+            if !lexical_contains(dest_root, &resolved_target) {
+                return Err(format!(
+                    "refusing symlink {} (escapes extraction root)",
+                    target.display()
+                ));
+            }
+            let parent = dest.parent().ok_or_else(|| {
+                format!(
+                    "failed to determine parent directory for archive path {}",
+                    path.display()
+                )
+            })?;
+            fs::create_dir_all(parent)
+                .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
+            ensure_no_symlink_ancestors(dest_root, &dest)?;
+            std::os::unix::fs::symlink(target.as_ref(), &dest).map_err(|error| {
+                format!(
+                    "failed to create symlink {} -> {}: {error}",
+                    dest.display(),
+                    target.display()
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn extract_archive_safe(
+    archive_path: &Path,
+    format: ArchiveFormat,
+    strip_components: usize,
+    dest_root: &Path,
+) -> Result<(), String> {
+    let dest_root = if dest_root.is_absolute() {
+        dest_root.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| format!("failed to get current directory: {error}"))?
+            .join(dest_root)
+    };
+    fs::create_dir_all(&dest_root)
+        .map_err(|error| format!("failed to create {}: {error}", dest_root.display()))?;
+    ensure_no_symlink_ancestors(&dest_root, &dest_root)?;
+
+    let file = fs::File::open(archive_path)
+        .map_err(|error| format!("failed to open archive {}: {error}", archive_path.display()))?;
+    match format {
+        ArchiveFormat::Tar => {
+            let mut archive = tar::Archive::new(file);
+            extract_archive_entries(&mut archive, strip_components, &dest_root)
+        }
+        ArchiveFormat::TarGz => {
+            let decoder = flate2::read::GzDecoder::new(file);
+            let mut archive = tar::Archive::new(decoder);
+            extract_archive_entries(&mut archive, strip_components, &dest_root)
+        }
+        ArchiveFormat::TarZst => {
+            let decoder = zstd::stream::Decoder::new(file)
+                .map_err(|error| format!("failed to open zstd archive: {error}"))?;
+            let mut archive = tar::Archive::new(decoder);
+            extract_archive_entries(&mut archive, strip_components, &dest_root)
+        }
+        ArchiveFormat::TarXz => {
+            let decoder = xz2::read::XzDecoder::new(file);
+            let mut archive = tar::Archive::new(decoder);
+            extract_archive_entries(&mut archive, strip_components, &dest_root)
+        }
+    }
+}
+
+fn archive_destination(staging_dir: &Path, to: &str) -> Result<PathBuf, String> {
+    let relative = Path::new(to.trim_start_matches('/'));
+    let Some(relative) = archive_entry_relative_path(relative, 0)? else {
+        return Ok(staging_dir.to_path_buf());
+    };
+    Ok(staging_dir.join(relative))
+}
+
+fn apply_archive_layer(
+    archive: &ResolvedArchive,
+    staging_dir: &Path,
+    cache_dir: &Path,
+    offline: bool,
+    layer_locks: &mut Vec<LayerLock>,
+) -> Result<(), String> {
+    let archive_path = fetch_archive_by_sha256(&archive.url, &archive.sha256, cache_dir, offline)?;
+    let dest_root = archive_destination(staging_dir, &archive.to)?;
+    extract_archive_safe(
+        &archive_path,
+        archive.format.clone(),
+        archive.strip_components,
+        &dest_root,
+    )?;
+    layer_locks.push(LayerLock::Archive {
+        source: LockPackageSource::archive(archive.url.clone(), archive.sha256.clone()),
+        to: archive.to.clone(),
+        format: archive.format.clone(),
+        strip_components: archive.strip_components,
+        hash: archive.sha256.clone(),
+    });
+    Ok(())
+}
+
 fn apply_copy_layer(
     file: &ResolvedFile,
     staging_dir: &Path,
     cache_dir: &Path,
     prev_section_lock: Option<&SectionLock>,
     tpl_ctx: &TemplateContext,
+    offline: bool,
     layer_locks: &mut Vec<LayerLock>,
 ) -> Result<(), String> {
     let local_path = match &file.source {
@@ -3006,7 +3728,8 @@ fn apply_copy_layer(
                     .find(|lock| copy_lock_matches_input(lock, file))
                     .map(|lock| lock.hash)
             });
-            let (path, hash) = fetch_url_cached(u, cache_dir, expected.as_deref())?;
+            let (path, hash) =
+                fetch_url_cached_with_offline(u, cache_dir, expected.as_deref(), offline)?;
             layer_locks.push(LayerLock::Copy {
                 source: u.clone(),
                 to: file.to.clone(),
@@ -3097,7 +3820,7 @@ fn plugin_packages_from_layers(
                     to: to.clone(),
                 });
             }
-            ResolvedLayer::Package(_) => {}
+            ResolvedLayer::Archive(_) | ResolvedLayer::Package(_) => {}
         }
     }
     Ok(packages)
@@ -4876,7 +5599,16 @@ to = "/system/scarlet/bin/video_player"
         };
         let mut layer_locks = Vec::new();
 
-        apply_copy_layer(&file, &staging, &cache, None, &tpl_ctx, &mut layer_locks).unwrap();
+        apply_copy_layer(
+            &file,
+            &staging,
+            &cache,
+            None,
+            &tpl_ctx,
+            false,
+            &mut layer_locks,
+        )
+        .unwrap();
 
         assert!(staging.join("data/config/system/linux-aarch64").is_dir());
         let _ = fs::remove_dir_all(&temp);
@@ -5338,6 +6070,429 @@ to = "/"
         .unwrap();
         assert_ne!(changed_destination, changed_source);
 
+        fs::remove_dir_all(&temp).unwrap();
+    }
+
+    fn archive_test_dir(name: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "cargo-scarlet-{name}-{}-{}",
+            std::process::id(),
+            NEXT_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn sha256_bytes(bytes: &[u8]) -> String {
+        format!("sha256:{}", hex::encode(Sha256::digest(bytes)))
+    }
+
+    fn tar_bytes(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        use std::io::Cursor;
+
+        let mut builder = tar::Builder::new(Vec::new());
+        for (path, content) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(content.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, path, Cursor::new(content.to_vec()))
+                .unwrap();
+        }
+        builder.finish().unwrap();
+        builder.into_inner().unwrap()
+    }
+
+    fn tar_bytes_with_raw_path(path: &str, content: &[u8]) -> Vec<u8> {
+        let mut bytes = tar_bytes(&[("safe", content)]);
+        assert!(path.len() < 100);
+        bytes[..100].fill(0);
+        bytes[..path.len()].copy_from_slice(path.as_bytes());
+        update_tar_header_checksum(&mut bytes);
+        bytes
+    }
+
+    fn tar_bytes_with_raw_type(entry_type: u8) -> Vec<u8> {
+        let mut bytes = tar_bytes(&[("safe", b"content")]);
+        bytes[156] = entry_type;
+        update_tar_header_checksum(&mut bytes);
+        bytes
+    }
+
+    fn update_tar_header_checksum(bytes: &mut [u8]) {
+        bytes[148..156].fill(b' ');
+        let checksum = bytes[..512]
+            .iter()
+            .fold(0u32, |sum, byte| sum + u32::from(*byte));
+        let encoded = format!("{checksum:06o}\0 ");
+        bytes[148..156].copy_from_slice(encoded.as_bytes());
+    }
+
+    fn tar_link_bytes(path: &str, target: &str, entry_type: tar::EntryType) -> Vec<u8> {
+        use std::io::Cursor;
+
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(entry_type);
+        header.set_size(0);
+        header.set_mode(0o777);
+        header.set_link_name(target).unwrap();
+        header.set_cksum();
+        builder
+            .append_data(&mut header, path, Cursor::new(Vec::new()))
+            .unwrap();
+        builder.finish().unwrap();
+        builder.into_inner().unwrap()
+    }
+
+    fn write_archive_fixture(temp: &Path, name: &str, bytes: &[u8]) -> PathBuf {
+        let path = temp.join(name);
+        fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    fn resolved_archive(url: &str, sha256: &str) -> ResolvedArchive {
+        ResolvedArchive {
+            url: url.to_string(),
+            sha256: normalize_sha256(sha256).unwrap(),
+            format: ArchiveFormat::TarGz,
+            strip_components: 1,
+            to: "/system/foo".to_string(),
+        }
+    }
+
+    fn expanded_with_archive(archive: ResolvedArchive) -> ExpandedManifest {
+        ExpandedManifest {
+            project_dir: PathBuf::from("/tmp/cargo-scarlet-test"),
+            manifest: ScarletManifest {
+                schema_version: 2,
+                project: ManifestProject {
+                    name: "test".to_string(),
+                },
+                bsp: None,
+                kernel: None,
+                modules: BTreeMap::new(),
+                images: BTreeMap::new(),
+                runner: None,
+            },
+            sections: BTreeMap::from([(
+                "rootfs".to_string(),
+                ResolvedSection {
+                    layers: vec![ResolvedLayer::Archive(archive)],
+                },
+            )]),
+        }
+    }
+
+    fn archive_lock(archive: &ResolvedArchive) -> LayerLock {
+        LayerLock::Archive {
+            source: LockPackageSource::archive(archive.url.clone(), archive.sha256.clone()),
+            to: archive.to.clone(),
+            format: archive.format.clone(),
+            strip_components: archive.strip_components,
+            hash: archive.sha256.clone(),
+        }
+    }
+
+    fn lock_with_archive(archive: &ResolvedArchive) -> ImageLock {
+        ImageLock {
+            sections: BTreeMap::from([(
+                "rootfs".to_string(),
+                SectionLock {
+                    hash: String::new(),
+                    layers: vec![archive_lock(archive)],
+                    files: Vec::new(),
+                    packages: Vec::new(),
+                },
+            )]),
+        }
+    }
+
+    #[test]
+    fn test_normalize_sha256_accepts_bare_hex() {
+        let hex = "ab".repeat(32);
+        assert_eq!(normalize_sha256(&hex).unwrap(), format!("sha256:{hex}"));
+    }
+
+    #[test]
+    fn test_normalize_sha256_accepts_prefixed() {
+        let hex = "cd".repeat(32);
+        assert_eq!(
+            normalize_sha256(&format!("sha256:{hex}")).unwrap(),
+            format!("sha256:{hex}")
+        );
+    }
+
+    #[test]
+    fn test_normalize_sha256_lowercases() {
+        let hex = "AB".repeat(32);
+        assert_eq!(
+            normalize_sha256(&hex).unwrap(),
+            format!("sha256:{}", hex.to_ascii_lowercase())
+        );
+    }
+
+    #[test]
+    fn test_normalize_sha256_rejects_bad_length() {
+        assert!(normalize_sha256("abc").is_err());
+    }
+
+    #[test]
+    fn test_archive_format_serde_kebab_case() {
+        let layer: ManifestLayer = toml::from_str(
+            r#"
+kind = "archive"
+url = "https://example.com/rootfs.tar.zst"
+sha256 = "aa"
+format = "tar-zst"
+to = "/system"
+"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            layer,
+            ManifestLayer::Archive {
+                format: ArchiveFormat::TarZst,
+                ..
+            }
+        ));
+        let serialized = toml::to_string(&layer).unwrap();
+        assert!(serialized.contains("format = \"tar-zst\""));
+    }
+
+    #[test]
+    fn test_extract_rejects_absolute_path() {
+        let temp = archive_test_dir("archive-absolute");
+        let archive = write_archive_fixture(
+            &temp,
+            "archive.tar",
+            &tar_bytes_with_raw_path("/etc/passwd", b"bad"),
+        );
+        let error = extract_archive_safe(&archive, ArchiveFormat::Tar, 0, &temp.join("dest"))
+            .expect_err("absolute paths must be rejected");
+        assert!(error.contains("absolute archive path"));
+        fs::remove_dir_all(&temp).unwrap();
+    }
+
+    #[test]
+    fn test_extract_rejects_dotdot_traversal() {
+        let temp = archive_test_dir("archive-dotdot");
+        let archive = write_archive_fixture(
+            &temp,
+            "archive.tar",
+            &tar_bytes_with_raw_path("../../etc/passwd", b"bad"),
+        );
+        let error = extract_archive_safe(&archive, ArchiveFormat::Tar, 0, &temp.join("dest"))
+            .expect_err("parent traversal must be rejected");
+        assert!(error.contains(".."));
+        fs::remove_dir_all(&temp).unwrap();
+    }
+
+    #[test]
+    fn test_extract_rejects_symlink_escape() {
+        let temp = archive_test_dir("archive-symlink-escape");
+        let archive = write_archive_fixture(
+            &temp,
+            "archive.tar",
+            &tar_link_bytes("lib", "../foo", tar::EntryType::symlink()),
+        );
+        let error = extract_archive_safe(&archive, ArchiveFormat::Tar, 0, &temp.join("dest"))
+            .expect_err("escaping symlink must be rejected");
+        assert!(error.contains("refusing symlink ../foo (escapes extraction root)"));
+        fs::remove_dir_all(&temp).unwrap();
+    }
+
+    #[test]
+    fn test_extract_allows_symlink_within_root() {
+        let temp = archive_test_dir("archive-symlink-safe");
+        let archive = write_archive_fixture(
+            &temp,
+            "archive.tar",
+            &tar_link_bytes("lib", "usr/lib", tar::EntryType::symlink()),
+        );
+        let dest = temp.join("dest");
+        extract_archive_safe(&archive, ArchiveFormat::Tar, 0, &dest).unwrap();
+        assert_eq!(
+            fs::read_link(dest.join("lib")).unwrap(),
+            Path::new("usr/lib")
+        );
+        fs::remove_dir_all(&temp).unwrap();
+    }
+
+    #[test]
+    fn test_extract_rejects_hardlink() {
+        let temp = archive_test_dir("archive-hardlink");
+        let archive = write_archive_fixture(
+            &temp,
+            "archive.tar",
+            &tar_link_bytes("lib", "usr/lib", tar::EntryType::hard_link()),
+        );
+        let error = extract_archive_safe(&archive, ArchiveFormat::Tar, 0, &temp.join("dest"))
+            .expect_err("hardlinks must be rejected");
+        assert!(error.contains("refusing hardlink"));
+        fs::remove_dir_all(&temp).unwrap();
+    }
+
+    #[test]
+    fn test_extract_rejects_device_entry() {
+        let temp = archive_test_dir("archive-device");
+        let archive = write_archive_fixture(&temp, "archive.tar", &tar_bytes_with_raw_type(b'4'));
+        let error = extract_archive_safe(&archive, ArchiveFormat::Tar, 0, &temp.join("dest"))
+            .expect_err("device entries must be rejected");
+        assert!(error.contains("refusing special archive entry"));
+        fs::remove_dir_all(&temp).unwrap();
+    }
+
+    #[test]
+    fn test_extract_strip_components() {
+        let temp = archive_test_dir("archive-strip");
+        let archive = write_archive_fixture(
+            &temp,
+            "archive.tar",
+            &tar_bytes(&[("root/foo.txt", b"foo"), ("root/sub/bar.txt", b"bar")]),
+        );
+        let dest = temp.join("dest");
+        extract_archive_safe(&archive, ArchiveFormat::Tar, 1, &dest).unwrap();
+        assert_eq!(fs::read(dest.join("foo.txt")).unwrap(), b"foo");
+        assert_eq!(fs::read(dest.join("sub/bar.txt")).unwrap(), b"bar");
+        fs::remove_dir_all(&temp).unwrap();
+    }
+
+    #[test]
+    fn test_fetch_archive_by_sha256_offline_miss() {
+        let temp = archive_test_dir("archive-offline-miss");
+        let expected = sha256_bytes(b"archive");
+        let error = fetch_archive_by_sha256(
+            "https://example.com/rootfs.tar",
+            &expected,
+            &temp.join("cache"),
+            true,
+        )
+        .expect_err("offline cache miss must fail");
+        assert!(error.contains("--offline: archive"));
+        assert!(error.contains(&expected));
+        fs::remove_dir_all(&temp).unwrap();
+    }
+
+    #[test]
+    fn test_fetch_archive_by_sha256_cache_hit_skips_network() {
+        let temp = archive_test_dir("archive-cache-hit");
+        let bytes = b"cached archive";
+        let expected = sha256_bytes(bytes);
+        let cache = temp.join("cache");
+        fs::create_dir_all(&cache).unwrap();
+        fs::write(cache.join(expected.strip_prefix("sha256:").unwrap()), bytes).unwrap();
+        let path = fetch_archive_by_sha256(
+            "https://127.0.0.1:9/must-not-be-requested.tar",
+            &expected,
+            &cache,
+            false,
+        )
+        .unwrap();
+        assert_eq!(fs::read(path).unwrap(), bytes);
+        fs::remove_dir_all(&temp).unwrap();
+    }
+
+    #[test]
+    fn test_fetch_archive_by_sha256_rejects_sha256_mismatch() {
+        let temp = archive_test_dir("archive-sha-mismatch");
+        let expected = sha256_bytes(b"expected archive");
+        let cache = temp.join("cache");
+        fs::create_dir_all(&cache).unwrap();
+        fs::write(
+            cache.join(expected.strip_prefix("sha256:").unwrap()),
+            b"tampered archive",
+        )
+        .unwrap();
+        let error =
+            fetch_archive_by_sha256("https://example.com/rootfs.tar", &expected, &cache, true)
+                .expect_err("mismatched cached archive must fail");
+        assert!(error.contains("archive SHA-256 mismatch"));
+        fs::remove_dir_all(&temp).unwrap();
+    }
+
+    #[test]
+    fn test_locked_drift_url_change() {
+        let archive = resolved_archive("https://example.com/new-rootfs.tar.gz", &"ab".repeat(32));
+        let mut lock_archive =
+            resolved_archive("https://example.com/old-rootfs.tar.gz", &"ab".repeat(32));
+        lock_archive.to = archive.to.clone();
+        let error = validate_locked_archive_layers(
+            &expanded_with_archive(archive),
+            &lock_with_archive(&lock_archive),
+        )
+        .expect_err("changed URL must drift");
+        assert!(error.contains("differs from scarlet.lock"));
+    }
+
+    #[test]
+    fn test_locked_drift_sha256_change() {
+        let archive = resolved_archive("https://example.com/rootfs.tar.gz", &"ab".repeat(32));
+        let lock_archive = resolved_archive("https://example.com/rootfs.tar.gz", &"cd".repeat(32));
+        let error = validate_locked_archive_layers(
+            &expanded_with_archive(archive),
+            &lock_with_archive(&lock_archive),
+        )
+        .expect_err("changed SHA-256 must drift");
+        assert!(error.contains("differs from scarlet.lock"));
+    }
+
+    #[test]
+    fn test_locked_missing_lock_entry() {
+        let archive = resolved_archive("https://example.com/rootfs.tar.gz", &"ab".repeat(32));
+        let error =
+            validate_locked_archive_layers(&expanded_with_archive(archive), &ImageLock::default())
+                .expect_err("missing archive lock must fail");
+        assert!(error.contains("is missing from scarlet.lock"));
+    }
+
+    #[test]
+    fn test_locked_no_drift_succeeds() {
+        let archive = resolved_archive("https://example.com/rootfs.tar.gz", &"ab".repeat(32));
+        validate_locked_archive_layers(
+            &expanded_with_archive(resolved_archive(
+                "https://example.com/rootfs.tar.gz",
+                &"ab".repeat(32),
+            )),
+            &lock_with_archive(&archive),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_end_to_end_fake_archive_extraction() {
+        use std::io::Write as _;
+
+        let temp = archive_test_dir("archive-end-to-end");
+        let tar = tar_bytes(&[("root/etc/issue", b"Scarlet\n"), ("root/bin/tool", b"tool")]);
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&tar).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let source = write_archive_fixture(&temp, "rootfs.tar.gz", &compressed);
+        let archive = ResolvedArchive {
+            url: format!("file://{}", source.display()),
+            sha256: sha256_bytes(&compressed),
+            format: ArchiveFormat::TarGz,
+            strip_components: 1,
+            to: "/system/foo".to_string(),
+        };
+        let staging = temp.join("staging");
+        let mut locks = Vec::new();
+        apply_archive_layer(&archive, &staging, &temp.join("cache"), false, &mut locks).unwrap();
+        assert_eq!(
+            fs::read(staging.join("system/foo/etc/issue")).unwrap(),
+            b"Scarlet\n"
+        );
+        assert_eq!(
+            fs::read(staging.join("system/foo/bin/tool")).unwrap(),
+            b"tool"
+        );
+        assert!(matches!(locks.as_slice(), [LayerLock::Archive { .. }]));
         fs::remove_dir_all(&temp).unwrap();
     }
 }
