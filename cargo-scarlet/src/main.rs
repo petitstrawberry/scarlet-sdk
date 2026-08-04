@@ -3590,10 +3590,75 @@ fn extract_archive_entries<R: Read>(
 
         let entry_type = entry.header().entry_type();
         if entry_type.is_hard_link() {
-            return Err(format!(
-                "refusing hardlink archive entry {}",
-                path.display()
-            ));
+            let target = entry
+                .link_name()
+                .map_err(|error| {
+                    format!(
+                        "failed to read hardlink target for {}: {error}",
+                        path.display()
+                    )
+                })?
+                .ok_or_else(|| format!("archive hardlink {} has no target", path.display()))?;
+            let Some(target_relative) =
+                archive_entry_relative_path(target.as_ref(), strip_components)?
+            else {
+                return Err(format!(
+                    "archive hardlink {} has an empty target",
+                    path.display()
+                ));
+            };
+            let target_dest = dest_root.join(target_relative);
+            if !target_dest.starts_with(dest_root) || !lexical_contains(dest_root, &target_dest) {
+                return Err(format!(
+                    "refusing hardlink {} (target escapes extraction root)",
+                    target.display()
+                ));
+            }
+            ensure_no_symlink_ancestors(dest_root, &target_dest)?;
+            let target_metadata = fs::symlink_metadata(&target_dest).map_err(|error| {
+                format!(
+                    "failed to inspect hardlink target {} for {}: {error}",
+                    target_dest.display(),
+                    path.display()
+                )
+            })?;
+            if !target_metadata.file_type().is_file() {
+                return Err(format!(
+                    "refusing hardlink {} to non-file {}",
+                    path.display(),
+                    target.display()
+                ));
+            }
+
+            let parent = dest.parent().ok_or_else(|| {
+                format!(
+                    "failed to determine directory for hardlink {}",
+                    path.display()
+                )
+            })?;
+            fs::create_dir_all(parent)
+                .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
+            ensure_no_symlink_ancestors(dest_root, &dest)?;
+            remove_existing_path(&dest)?;
+            fs::copy(&target_dest, &dest).map_err(|error| {
+                format!(
+                    "failed to materialize hardlink {} -> {}: {error}",
+                    path.display(),
+                    target.display()
+                )
+            })?;
+            let mode =
+                entry.header().mode().map_err(|error| {
+                    format!("failed to read mode for {}: {error}", path.display())
+                })? & (0o7777 & !0o7000);
+            fs::set_permissions(&dest, std::os::unix::fs::PermissionsExt::from_mode(mode))
+                .map_err(|error| {
+                    format!(
+                        "failed to set permissions on hardlink {}: {error}",
+                        dest.display()
+                    )
+                })?;
+            continue;
         }
         if !entry_type.is_file() && !entry_type.is_dir() && !entry_type.is_symlink() {
             return Err(format!("refusing special archive entry {}", path.display()));
@@ -6463,16 +6528,50 @@ to = "/system"
     }
 
     #[test]
-    fn test_extract_rejects_hardlink() {
+    fn test_extract_materializes_hardlink() {
+        use std::io::Cursor;
+
         let temp = archive_test_dir("archive-hardlink");
-        let archive = write_archive_fixture(
-            &temp,
-            "archive.tar",
-            &tar_link_bytes("lib", "usr/lib", tar::EntryType::hard_link()),
+        let mut builder = tar::Builder::new(Vec::new());
+
+        let mut target_header = tar::Header::new_gnu();
+        target_header.set_size(3);
+        target_header.set_mode(0o644);
+        target_header.set_cksum();
+        builder
+            .append_data(
+                &mut target_header,
+                "root/kms_swrast_dri.so",
+                Cursor::new(b"dri"),
+            )
+            .unwrap();
+
+        let mut link_header = tar::Header::new_gnu();
+        link_header.set_entry_type(tar::EntryType::hard_link());
+        link_header.set_size(0);
+        link_header.set_mode(0o644);
+        link_header.set_link_name("root/kms_swrast_dri.so").unwrap();
+        link_header.set_cksum();
+        builder
+            .append_data(
+                &mut link_header,
+                "root/swrast_dri.so",
+                Cursor::new(Vec::<u8>::new()),
+            )
+            .unwrap();
+        builder.finish().unwrap();
+        let archive = write_archive_fixture(&temp, "archive.tar", &builder.into_inner().unwrap());
+
+        let dest = temp.join("dest");
+        extract_archive_safe(&archive, ArchiveFormat::Tar, 1, &dest).unwrap();
+        assert_eq!(fs::read(dest.join("kms_swrast_dri.so")).unwrap(), b"dri");
+        assert_eq!(fs::read(dest.join("swrast_dri.so")).unwrap(), b"dri");
+        assert!(
+            fs::symlink_metadata(dest.join("swrast_dri.so"))
+                .unwrap()
+                .file_type()
+                .is_file()
         );
-        let error = extract_archive_safe(&archive, ArchiveFormat::Tar, 0, &temp.join("dest"))
-            .expect_err("hardlinks must be rejected");
-        assert!(error.contains("refusing hardlink"));
         fs::remove_dir_all(&temp).unwrap();
     }
 
