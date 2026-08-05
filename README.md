@@ -68,6 +68,18 @@ source = { git = "https://github.com/petitstrawberry/Scarlet", rev = "<commit-sh
 subdir = "bundles/desktop"
 ```
 
+Cargo layers may likewise select a package directory below a Git checkout:
+
+```toml
+[[layers]]
+kind = "cargo"
+source = { git = "https://github.com/petitstrawberry/scarlet-ui" }
+subdir = "examples/widget-factory"
+package = "scarlet-ui-widget-factory"
+bin = "scarlet-ui-widget-factory"
+to = "/system/scarlet/bin/widget_factory"
+```
+
 Example:
 
 ```toml

@@ -318,6 +318,8 @@ enum ManifestLayer {
     },
     Cargo {
         source: PackageSource,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subdir: Option<String>,
         package: Option<String>,
         bin: Option<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -449,6 +451,8 @@ struct PackageLock {
     package: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     bin: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    subdir: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     features: Vec<String>,
     #[serde(rename = "default-features")]
@@ -494,6 +498,8 @@ enum LayerLock {
         package: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         bin: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        subdir: Option<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         features: Vec<String>,
         #[serde(rename = "default-features")]
@@ -560,6 +566,7 @@ impl SectionLock {
                     resolved_rev,
                     package,
                     bin,
+                    subdir,
                     features,
                     default_features,
                     to,
@@ -572,6 +579,7 @@ impl SectionLock {
                     resolved_rev: resolved_rev.clone(),
                     package: package.clone(),
                     bin: bin.clone(),
+                    subdir: subdir.clone(),
                     features: features.clone(),
                     default_features: *default_features,
                     to: to.clone(),
@@ -591,6 +599,7 @@ impl SectionLock {
                     resolved_rev: None,
                     package: None,
                     bin: None,
+                    subdir: None,
                     features: Vec::new(),
                     default_features: None,
                     to: to.clone(),
@@ -637,6 +646,7 @@ fn package_lock_to_layer(lock: PackageLock) -> LayerLock {
             resolved_rev: lock.resolved_rev,
             package: lock.package,
             bin: lock.bin,
+            subdir: lock.subdir,
             features: lock.features,
             default_features: lock.default_features,
             to: lock.to,
@@ -678,6 +688,9 @@ fn package_lock_matches_input(
         return Ok(false);
     }
     if lock.bin != pkg.bin {
+        return Ok(false);
+    }
+    if lock.subdir != pkg.subdir {
         return Ok(false);
     }
     if lock.features != pkg.features {
@@ -809,6 +822,7 @@ fn package_input_lock(
         resolved_rev: pkg.resolved_rev.clone(),
         package: pkg.package_name.clone(),
         bin: pkg.bin.clone(),
+        subdir: pkg.subdir.clone(),
         features: pkg.features.clone(),
         default_features: pkg.default_features,
         to: pkg.to.clone(),
@@ -834,6 +848,7 @@ fn find_package_lock_for_input(
         lock.kind == pkg.kind.as_deref().unwrap_or("")
             && lock.source == source
             && lock.bin == pkg.bin
+            && lock.subdir == pkg.subdir
             && lock.features == pkg.features
             && lock.default_features == pkg.default_features
             && lock.git == package_git_url(pkg)
@@ -847,6 +862,7 @@ struct ResolvedPackage {
     resolved_rev: Option<String>,
     package_name: Option<String>,
     bin: Option<String>,
+    subdir: Option<String>,
     features: Vec<String>,
     default_features: Option<bool>,
     from: Option<PathBuf>,
@@ -859,6 +875,7 @@ struct PackageLayerSpec {
     source: Option<PackageSource>,
     package: Option<String>,
     bin: Option<String>,
+    subdir: Option<String>,
     features: Vec<String>,
     default_features: Option<bool>,
     from: Option<String>,
@@ -989,6 +1006,10 @@ fn resolve_package(
         resolved_rev: None,
         package_name: pkg.package.clone(),
         bin: pkg.bin.clone(),
+        subdir: pkg
+            .subdir
+            .as_ref()
+            .map(|subdir| expand_templates(subdir, target_triple, arch)),
         features: pkg.features.clone(),
         default_features: pkg.default_features,
         from: pkg.from.as_ref().and_then(|s| {
@@ -1525,6 +1546,7 @@ fn resolve_layers_into(
             }
             ManifestLayer::Cargo {
                 source,
+                subdir,
                 package,
                 bin,
                 features,
@@ -1537,6 +1559,7 @@ fn resolve_layers_into(
                     source: Some(source.clone()),
                     package: package.clone(),
                     bin: bin.clone(),
+                    subdir: subdir.clone(),
                     features: features.clone(),
                     default_features: *default_features,
                     from: None,
@@ -1562,6 +1585,7 @@ fn resolve_layers_into(
                     source: Some(PackageSource::Path(source.clone())),
                     package: None,
                     bin: None,
+                    subdir: None,
                     features: Vec::new(),
                     default_features: None,
                     from: None,
@@ -3947,6 +3971,38 @@ fn copy_path_or_dir(source: &Path, dest: &Path) -> Result<(), String> {
     }
 }
 
+fn package_build_root(pkg: &ResolvedPackage) -> Result<PathBuf, String> {
+    let source = pkg
+        .local_source
+        .as_ref()
+        .ok_or("cargo package missing source")?;
+    let Some(subdir) = pkg.subdir.as_deref() else {
+        return Ok(source.clone());
+    };
+
+    let subdir = Path::new(subdir);
+    if subdir.components().any(|component| {
+        matches!(
+            component,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    }) {
+        return Err(format!(
+            "cargo package subdir must stay within its source checkout: {}",
+            subdir.display()
+        ));
+    }
+
+    let build_root = source.join(subdir);
+    if !build_root.join("Cargo.toml").is_file() {
+        return Err(format!(
+            "cargo package manifest not found: {}",
+            build_root.join("Cargo.toml").display()
+        ));
+    }
+    Ok(build_root)
+}
+
 fn install_package(
     staging_dir: &Path,
     pkg: &ResolvedPackage,
@@ -3964,10 +4020,7 @@ fn install_package(
 
     match pkg.kind.as_deref() {
         Some("cargo") => {
-            let source = pkg
-                .local_source
-                .as_ref()
-                .ok_or("cargo package missing source")?;
+            let source = package_build_root(pkg)?;
             let package_name = pkg.package_name.as_deref().unwrap_or("user-bin");
             let bin_name = pkg.bin.as_deref().unwrap_or(package_name);
 
@@ -4006,7 +4059,7 @@ fn install_package(
                 }
 
                 let status = cmd
-                    .current_dir(source)
+                    .current_dir(&source)
                     .status()
                     .map_err(|e| format!("failed to run cargo build: {e}"))?;
 
@@ -4051,6 +4104,7 @@ fn install_package(
                 resolved_rev,
                 package: pkg.package_name.clone(),
                 bin: pkg.bin.clone(),
+                subdir: pkg.subdir.clone(),
                 features: pkg.features.clone(),
                 default_features: pkg.default_features,
                 to: pkg.to.clone(),
@@ -4168,6 +4222,7 @@ fn install_package(
                 resolved_rev: None,
                 package: None,
                 bin: None,
+                subdir: None,
                 features: Vec::new(),
                 default_features: None,
                 to: pkg.to.clone(),
@@ -5381,6 +5436,7 @@ mod tests {
             resolved_rev: None,
             package: None,
             bin: Some("sh".to_string()),
+            subdir: None,
             features: Vec::new(),
             default_features: None,
             to: "/bin/sh".to_string(),
@@ -5417,6 +5473,7 @@ mod tests {
             resolved_rev: Some("abc123".to_string()),
             package: None,
             bin: Some("tool".to_string()),
+            subdir: None,
             features: Vec::new(),
             default_features: None,
             to: "/bin/tool".to_string(),
@@ -5481,10 +5538,30 @@ to = "/system/scarlet/bin/video_player"
     }
 
     #[test]
+    fn bundle_cargo_layer_accepts_git_subdir() {
+        let toml_str = r#"
+[[layers]]
+kind = "cargo"
+source = { git = "https://github.com/example/widgets" }
+subdir = "examples/widget-factory"
+package = "widget-factory"
+bin = "widget-factory"
+to = "/bin/widget-factory"
+"#;
+        let bundle: BundleManifest = toml::from_str(toml_str).unwrap();
+        let ManifestLayer::Cargo { subdir, .. } = &bundle.layers[0] else {
+            panic!("expected cargo layer");
+        };
+
+        assert_eq!(subdir.as_deref(), Some("examples/widget-factory"));
+    }
+
+    #[test]
     fn cargo_layer_replace_removes_previous_same_destination() {
         let layers = vec![
             ManifestLayer::Cargo {
                 source: PackageSource::Path("user/video_player".to_string()),
+                subdir: None,
                 package: Some("video_player".to_string()),
                 bin: Some("video_player".to_string()),
                 features: vec!["h264-stateful-hw".to_string(), "mp4-aac".to_string()],
@@ -5494,6 +5571,7 @@ to = "/system/scarlet/bin/video_player"
             },
             ManifestLayer::Cargo {
                 source: PackageSource::Path("user/video_player".to_string()),
+                subdir: None,
                 package: Some("video_player".to_string()),
                 bin: Some("video_player".to_string()),
                 features: vec![
@@ -5627,6 +5705,7 @@ to = "/system/scarlet/bin/video_player"
             resolved_rev: None,
             package: Some("apps".to_string()),
             bin: Some("sh".to_string()),
+            subdir: Some("apps".to_string()),
             features: vec!["h264-stateful-hw".to_string()],
             default_features: Some(false),
             to: "/bin/sh".to_string(),
@@ -5640,6 +5719,7 @@ to = "/system/scarlet/bin/video_player"
             resolved_rev: None,
             package_name: Some("apps".to_string()),
             bin: Some("sh".to_string()),
+            subdir: Some("apps".to_string()),
             features: vec!["h264-stateful-hw".to_string()],
             default_features: Some(false),
             from: None,
@@ -5654,6 +5734,46 @@ to = "/system/scarlet/bin/video_player"
         pkg.to = "/bin/sh".to_string();
         pkg.features = vec!["vp9-stateless-hw".to_string()];
         assert!(!package_lock_matches_input(project, &lock, &pkg).unwrap());
+        pkg.features = vec!["h264-stateful-hw".to_string()];
+        pkg.subdir = Some("other-apps".to_string());
+        assert!(!package_lock_matches_input(project, &lock, &pkg).unwrap());
+    }
+
+    #[test]
+    fn package_build_root_uses_safe_subdir() {
+        let source = std::env::temp_dir().join(format!(
+            "cargo-scarlet-package-subdir-test-{}",
+            std::process::id()
+        ));
+        let build_root = source.join("examples/widget-factory");
+        let _ = fs::remove_dir_all(&source);
+        fs::create_dir_all(&build_root).unwrap();
+        fs::write(
+            build_root.join("Cargo.toml"),
+            "[package]\nname = \"test\"\n",
+        )
+        .unwrap();
+
+        let mut pkg = ResolvedPackage {
+            kind: Some("cargo".to_string()),
+            source: Some(PackageSource::Path(source.to_string_lossy().to_string())),
+            local_source: Some(source.clone()),
+            resolved_rev: None,
+            package_name: Some("test".to_string()),
+            bin: Some("test".to_string()),
+            subdir: Some("examples/widget-factory".to_string()),
+            features: Vec::new(),
+            default_features: None,
+            from: None,
+            to: "/bin/test".to_string(),
+            output: None,
+        };
+
+        assert_eq!(package_build_root(&pkg).unwrap(), build_root);
+        pkg.subdir = Some("../outside".to_string());
+        assert!(package_build_root(&pkg).is_err());
+
+        fs::remove_dir_all(source).unwrap();
     }
 
     #[test]
