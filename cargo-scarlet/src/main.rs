@@ -1883,6 +1883,10 @@ fn sha256_dir_recursive(dir: &Path, hasher: &mut Sha256) -> Result<(), String> {
 
 fn cmd_update(project: &Path, offline: bool) -> Result<(), String> {
     let mut expanded = expand_manifest_with_offline(project, offline)?;
+    if !offline {
+        let bsp = manifest_bsp_config(&expanded.manifest, project)?;
+        refresh_bsp_lock(&bsp.root, offline)?;
+    }
     let git_cache_dir = project.join(".scarlet/cache/git");
     let file_cache_dir = project.join(".scarlet/cache/files");
     let mut lock = load_lock(project);
@@ -2010,6 +2014,8 @@ fn run() -> Result<(), String> {
                 release,
                 "check",
                 &[],
+                false,
+                false,
             )
         }
         Commands::Build {
@@ -2038,6 +2044,8 @@ fn run() -> Result<(), String> {
                     release,
                     "build",
                     &[],
+                    locked,
+                    offline,
                 )?;
                 inject_ksym_section_manifest(&project, &expanded, target.as_deref(), release)
             }
@@ -2057,6 +2065,8 @@ fn run() -> Result<(), String> {
                 release,
                 "clippy",
                 &extra_args,
+                false,
+                false,
             )
         }
         Commands::Run {
@@ -2142,6 +2152,7 @@ fn run() -> Result<(), String> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cargo_build_manifest(
     project: &Path,
     expanded: &ExpandedManifest,
@@ -2149,6 +2160,8 @@ fn cargo_build_manifest(
     release: bool,
     subcommand: &str,
     extra_args: &[String],
+    locked: bool,
+    offline: bool,
 ) -> Result<(), String> {
     let bsp = manifest_bsp_config(&expanded.manifest, project)?;
     let resolved_target = target
@@ -2162,6 +2175,15 @@ fn cargo_build_manifest(
         bsp.package,
         &bsp.disabled_kernel_features,
     )?;
+
+    // Refresh git dependencies in the BSP Cargo.lock before building.
+    // Without this, `cargo scarlet image` silently reuses the kernel
+    // revision pinned in the BSP lock file even when the manifest points
+    // at a branch whose tip has advanced. Skip when --locked (explicit
+    // freeze) or --offline (no network).
+    if !locked && !offline {
+        refresh_bsp_lock(&bsp.root, offline)?;
+    }
 
     let mut command = Command::new("cargo");
     command.arg(subcommand);
@@ -2196,6 +2218,29 @@ fn cargo_build_manifest(
     } else {
         Err(format!("cargo {subcommand} failed with status {status}"))
     }
+}
+
+/// Run `cargo update --workspace` in the BSP so git dependencies such as the
+/// kernel revision are not stuck at whatever was pinned in the BSP's
+/// Cargo.lock on the very first build.
+fn refresh_bsp_lock(bsp_root: &Path, offline: bool) -> Result<(), String> {
+    if offline {
+        return Ok(());
+    }
+    let mut update_cmd = Command::new("cargo");
+    update_cmd.arg("update").arg("--workspace");
+    update_cmd.current_dir(bsp_root);
+    eprintln!(
+        "cargo-scarlet: refreshing BSP dependencies in {} -> cargo update",
+        bsp_root.display()
+    );
+    let status = update_cmd
+        .status()
+        .map_err(|e| format!("failed to run cargo update: {e}"))?;
+    if !status.success() {
+        return Err(format!("cargo update failed with status {status}"));
+    }
+    Ok(())
 }
 
 fn inject_ksym_section_manifest(
@@ -2328,7 +2373,16 @@ fn build_manifest_image(
     }
 
     if !no_build {
-        cargo_build_manifest(project, &expanded, target.as_deref(), release, "build", &[])?;
+        cargo_build_manifest(
+            project,
+            &expanded,
+            target.as_deref(),
+            release,
+            "build",
+            &[],
+            locked,
+            offline,
+        )?;
         inject_ksym_section_manifest(project, &expanded, target.as_deref(), release)?;
     }
 
