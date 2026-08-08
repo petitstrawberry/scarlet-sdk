@@ -2181,6 +2181,11 @@ fn cargo_build_manifest(
     // revision pinned in the BSP lock file even when the manifest points
     // at a branch whose tip has advanced. Skip when --locked (explicit
     // freeze) or --offline (no network).
+    //
+    // Note: do NOT pass --workspace here. The BSP depends on the kernel
+    // through a generated path dependency (`.scarlet/scarlet-modules`),
+    // and `cargo update --workspace` leaves git dependencies reachable
+    // only through path dependencies untouched.
     if !locked && !offline {
         refresh_bsp_lock(&bsp.root, offline)?;
     }
@@ -2220,7 +2225,7 @@ fn cargo_build_manifest(
     }
 }
 
-/// Run `cargo update --workspace` in the BSP so git dependencies such as the
+/// Run `cargo update` in the BSP so git dependencies such as the
 /// kernel revision are not stuck at whatever was pinned in the BSP's
 /// Cargo.lock on the very first build.
 fn refresh_bsp_lock(bsp_root: &Path, offline: bool) -> Result<(), String> {
@@ -2228,7 +2233,7 @@ fn refresh_bsp_lock(bsp_root: &Path, offline: bool) -> Result<(), String> {
         return Ok(());
     }
     let mut update_cmd = Command::new("cargo");
-    update_cmd.arg("update").arg("--workspace");
+    update_cmd.arg("update");
     update_cmd.current_dir(bsp_root);
     eprintln!(
         "cargo-scarlet: refreshing BSP dependencies in {} -> cargo update",
