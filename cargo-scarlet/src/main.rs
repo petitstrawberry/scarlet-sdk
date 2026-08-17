@@ -186,7 +186,22 @@ struct ScarletManifest {
     #[serde(default)]
     images: BTreeMap<String, ManifestImageSection>,
     #[serde(default)]
+    hooks: ManifestHooks,
+    #[serde(default)]
     runner: Option<ManifestRunner>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ManifestHooks {
+    #[serde(default, rename = "post-image")]
+    post_image: Option<ManifestHook>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ManifestHook {
+    command: String,
+    #[serde(default)]
+    args: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2715,8 +2730,58 @@ fn build_manifest_image(
         new_lock.sections.len()
     );
     save_lock(project, &new_lock)?;
+    run_post_image_hook(
+        project,
+        expanded.manifest.hooks.post_image.as_ref(),
+        &target_triple,
+        profile,
+    )?;
 
     Ok(())
+}
+
+fn run_post_image_hook(
+    project: &Path,
+    hook: Option<&ManifestHook>,
+    target_triple: &str,
+    profile: &str,
+) -> Result<(), String> {
+    let Some(hook) = hook else {
+        return Ok(());
+    };
+
+    let hook_path = if Path::new(&hook.command).is_absolute() {
+        PathBuf::from(&hook.command)
+    } else {
+        project.join(&hook.command)
+    };
+
+    eprintln!(
+        "cargo-scarlet: running post-image hook {}",
+        hook_path.display()
+    );
+    let status = Command::new(&hook_path)
+        .args(&hook.args)
+        .current_dir(project)
+        .env("SCARLET_PROJECT_DIR", project)
+        .env("SCARLET_TARGET_TRIPLE", target_triple)
+        .env("SCARLET_PROFILE", profile)
+        .status()
+        .map_err(|error| {
+            format!(
+                "failed to run post-image hook {}: {error}",
+                hook_path.display()
+            )
+        })?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "post-image hook {} failed with status {status}",
+            hook_path.display()
+        ))
+    }
 }
 
 fn run_plugin<T: Serialize>(name: &str, request: &T) -> Result<(), String> {
@@ -5436,6 +5501,64 @@ fn which(cmd: &str) -> bool {
 mod tests {
     use super::*;
 
+    #[test]
+    fn manifest_parses_post_image_hook() {
+        let manifest: ScarletManifest = toml::from_str(
+            r#"
+schema_version = 2
+
+[project]
+name = "hook-test"
+
+[hooks.post-image]
+command = "tools/post-image.sh"
+args = ["--verify"]
+"#,
+        )
+        .unwrap();
+
+        let hook = manifest.hooks.post_image.expect("missing post-image hook");
+        assert_eq!(hook.command, "tools/post-image.sh");
+        assert_eq!(hook.args, ["--verify"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn post_image_hook_runs_relative_to_project_with_context() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let project = std::env::temp_dir().join(format!(
+            "cargo-scarlet-post-image-hook-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&project);
+        fs::create_dir_all(project.join("tools")).unwrap();
+        let hook_path = project.join("tools/post-image.sh");
+        fs::write(
+            &hook_path,
+            "#!/bin/sh\nprintf '%s\\n%s\\n%s\\n%s\\n' \"$PWD\" \"$SCARLET_PROJECT_DIR\" \"$SCARLET_TARGET_TRIPLE\" \"$SCARLET_PROFILE\" > hook.out\nprintf '%s\\n' \"$1\" >> hook.out\n",
+        )
+        .unwrap();
+        fs::set_permissions(&hook_path, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let hook = ManifestHook {
+            command: "tools/post-image.sh".to_string(),
+            args: vec!["argument".to_string()],
+        };
+        run_post_image_hook(&project, Some(&hook), "aarch64-unknown-scarlet", "release").unwrap();
+
+        let output = fs::read_to_string(project.join("hook.out")).unwrap();
+        assert_eq!(
+            output,
+            format!(
+                "{}\n{}\naarch64-unknown-scarlet\nrelease\nargument\n",
+                project.display(),
+                project.display()
+            )
+        );
+        fs::remove_dir_all(&project).unwrap();
+    }
+
     fn metadata_with_kernel_features(features: &[&str]) -> CargoMetadata {
         CargoMetadata {
             packages: vec![CargoMetadataPackage {
@@ -6459,6 +6582,7 @@ to = "/"
                 kernel: None,
                 modules: BTreeMap::new(),
                 images: BTreeMap::new(),
+                hooks: ManifestHooks::default(),
                 runner: None,
             },
             sections: BTreeMap::from([(
