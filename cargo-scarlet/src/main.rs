@@ -1165,6 +1165,15 @@ fn project_cargo_target_dir(project: &Path) -> PathBuf {
     project.join(".scarlet/cache/target")
 }
 
+fn package_cargo_target_dir(project: &Path, package_root: &Path) -> PathBuf {
+    let package_root =
+        fs::canonicalize(package_root).unwrap_or_else(|_| package_root.to_path_buf());
+    let mut hasher = Sha256::new();
+    hasher.update(package_root.to_string_lossy().as_bytes());
+    let identity = hex::encode(hasher.finalize());
+    project_cargo_target_dir(project).join(&identity[..16])
+}
+
 fn git_ensure_checkout(
     url: &str,
     rev: &str,
@@ -4154,7 +4163,12 @@ fn install_package(
             } else {
                 "debug"
             };
-            let target_dir = project_cargo_target_dir(project);
+            // Different package sources can contain crates with identical names,
+            // versions, and features but incompatible metadata. Sharing one Cargo
+            // target directory across those workspaces lets a later build observe
+            // stale artifacts from an earlier source checkout. Keep reuse within
+            // one package root while isolating independent Cargo workspaces.
+            let target_dir = package_cargo_target_dir(project, &source);
 
             let binary = {
                 eprintln!(
@@ -5500,6 +5514,18 @@ fn which(cmd: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cargo_targets_are_stable_per_package_root_and_isolated_between_roots() {
+        let project = Path::new("/tmp/scarlet-project");
+        let first = package_cargo_target_dir(project, Path::new("/tmp/source-a"));
+        let first_again = package_cargo_target_dir(project, Path::new("/tmp/source-a"));
+        let second = package_cargo_target_dir(project, Path::new("/tmp/source-b"));
+
+        assert_eq!(first, first_again);
+        assert_ne!(first, second);
+        assert!(first.starts_with(project_cargo_target_dir(project)));
+    }
 
     #[test]
     fn manifest_parses_post_image_hook() {
