@@ -1165,6 +1165,16 @@ fn project_cargo_target_dir(project: &Path) -> PathBuf {
     project.join(".scarlet/cache/target")
 }
 
+fn project_cargo_home(project: &Path) -> PathBuf {
+    project.join(".scarlet/cache/cargo-home")
+}
+
+fn project_cargo_command(project: &Path) -> Command {
+    let mut command = Command::new("cargo");
+    command.env("CARGO_HOME", project_cargo_home(project));
+    command
+}
+
 fn package_cargo_target_dir(project: &Path, package_root: &Path) -> PathBuf {
     let package_root =
         fs::canonicalize(package_root).unwrap_or_else(|_| package_root.to_path_buf());
@@ -1909,7 +1919,7 @@ fn cmd_update(project: &Path, offline: bool) -> Result<(), String> {
     let mut expanded = expand_manifest_with_offline(project, offline)?;
     if !offline {
         let bsp = manifest_bsp_config(&expanded.manifest, project)?;
-        refresh_bsp_lock(&bsp.root, offline)?;
+        refresh_bsp_lock(project, &bsp.root, offline)?;
     }
     let git_cache_dir = project.join(".scarlet/cache/git");
     let file_cache_dir = project.join(".scarlet/cache/files");
@@ -2194,6 +2204,7 @@ fn cargo_build_manifest(
     let target_arg = build_target_arg(&bsp.root, &resolved_target);
 
     metadata_check(
+        project,
         &bsp.root,
         &target_arg,
         bsp.package,
@@ -2211,10 +2222,10 @@ fn cargo_build_manifest(
     // and `cargo update --workspace` leaves git dependencies reachable
     // only through path dependencies untouched.
     if !locked && !offline {
-        refresh_bsp_lock(&bsp.root, offline)?;
+        refresh_bsp_lock(project, &bsp.root, offline)?;
     }
 
-    let mut command = Command::new("cargo");
+    let mut command = project_cargo_command(project);
     command.arg(subcommand);
     if release {
         command.arg("--release");
@@ -2252,11 +2263,11 @@ fn cargo_build_manifest(
 /// Run `cargo update` in the BSP so git dependencies such as the
 /// kernel revision are not stuck at whatever was pinned in the BSP's
 /// Cargo.lock on the very first build.
-fn refresh_bsp_lock(bsp_root: &Path, offline: bool) -> Result<(), String> {
+fn refresh_bsp_lock(project: &Path, bsp_root: &Path, offline: bool) -> Result<(), String> {
     if offline {
         return Ok(());
     }
-    let mut update_cmd = Command::new("cargo");
+    let mut update_cmd = project_cargo_command(project);
     update_cmd.arg("update");
     update_cmd.current_dir(bsp_root);
     eprintln!(
@@ -4175,7 +4186,7 @@ fn install_package(
                     "cargo-scarlet: building {} ({}) for {}...",
                     package_name, bin_name, userspace_triple
                 );
-                let mut cmd = Command::new("cargo");
+                let mut cmd = project_cargo_command(project);
                 cmd.arg("build");
                 if profile == "release" {
                     cmd.arg("--release");
@@ -4541,12 +4552,13 @@ struct CargoResolveNode {
 }
 
 fn metadata_check(
+    cargo_project: &Path,
     project: &Path,
     target: &str,
     kernel_package: &str,
     disabled_kernel_features: &[String],
 ) -> Result<(), String> {
-    let mut command = Command::new("cargo");
+    let mut command = project_cargo_command(cargo_project);
     command
         .arg("metadata")
         .arg("--format-version")
@@ -4925,7 +4937,7 @@ fn build_loadable_module(
         target_path.display()
     );
 
-    let mut command = Command::new("cargo");
+    let mut command = project_cargo_command(&module_dir);
     command.arg("rustc").arg("--target").arg(&target_path);
     if release {
         command.arg("--release");
@@ -5514,6 +5526,18 @@ fn which(cmd: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cargo_commands_use_project_local_cargo_home() {
+        let project = Path::new("/tmp/scarlet-project");
+        let command = project_cargo_command(project);
+        let cargo_home = command
+            .get_envs()
+            .find_map(|(key, value)| (key == "CARGO_HOME").then_some(value).flatten());
+        let expected = project_cargo_home(project);
+
+        assert_eq!(cargo_home, Some(expected.as_os_str()));
+    }
 
     #[test]
     fn cargo_targets_are_stable_per_package_root_and_isolated_between_roots() {

@@ -80,6 +80,20 @@ bin = "scarlet-ui-widget-factory"
 to = "/system/scarlet/bin/widget_factory"
 ```
 
+### Project-local caches
+
+`cargo-scarlet` keeps build inputs and child Cargo state inside the project:
+
+- `.scarlet/cache/git` contains Git bundle and package-source checkouts managed
+  directly by `cargo-scarlet`.
+- `.scarlet/cache/files` contains downloaded copy and archive layer inputs.
+- `.scarlet/cache/target` contains Cargo build outputs, isolated by package
+  source root.
+- `.scarlet/cache/cargo-home` is the `CARGO_HOME` used by child Cargo commands
+  for registry and transitive Git dependencies.
+
+Child Cargo commands do not use the invoking user's `~/.cargo` cache.
+
 Example:
 
 ```toml
