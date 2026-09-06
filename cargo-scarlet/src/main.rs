@@ -34,8 +34,6 @@ enum Commands {
         output: Option<PathBuf>,
         #[arg(long)]
         locked: bool,
-        #[arg(long)]
-        offline: bool,
     },
     Check {
         #[arg(long)]
@@ -66,8 +64,6 @@ enum Commands {
         no_image: bool,
         #[arg(long)]
         locked: bool,
-        #[arg(long)]
-        offline: bool,
         #[arg(last = true)]
         extra_args: Vec<String>,
     },
@@ -84,8 +80,6 @@ enum Commands {
         no_build: bool,
         #[arg(long)]
         locked: bool,
-        #[arg(long)]
-        offline: bool,
     },
     New {
         /// Scaffold a loadable Scarlet module (LSM).
@@ -103,8 +97,6 @@ enum Commands {
     Update {
         #[arg(long)]
         project: PathBuf,
-        #[arg(long)]
-        offline: bool,
     },
 }
 
@@ -1175,44 +1167,22 @@ fn package_cargo_target_dir(project: &Path, package_root: &Path) -> PathBuf {
     project_cargo_target_dir(project).join(&identity[..16])
 }
 
-fn git_ensure_checkout(
-    url: &str,
-    rev: &str,
-    cache_base: &Path,
-    offline: bool,
-) -> Result<PathBuf, String> {
+fn git_ensure_checkout(url: &str, rev: &str, cache_base: &Path) -> Result<PathBuf, String> {
     let dir = git_cache_dir_for_url(url, cache_base);
     if dir.join(".git").exists() {
         let head_rev = git_current_rev(&dir)?;
         if head_rev == rev {
             return Ok(dir);
         }
-        if offline {
-            let output = Command::new("git")
-                .args(["rev-parse", "--verify", &format!("{rev}^{{commit}}")])
-                .current_dir(&dir)
-                .output()
-                .map_err(|error| format!("failed to inspect cached git source: {error}"))?;
-            if !output.status.success() {
-                return Err(format!(
-                    "--offline: cached git source {url} does not contain revision {rev}"
-                ));
-            }
-        } else {
-            let status = Command::new("git")
-                .arg("fetch")
-                .arg("origin")
-                .current_dir(&dir)
-                .status()
-                .map_err(|e| format!("git fetch failed: {e}"))?;
-            if !status.success() {
-                return Err(format!("git fetch failed in {}", dir.display()));
-            }
+        let status = Command::new("git")
+            .arg("fetch")
+            .arg("origin")
+            .current_dir(&dir)
+            .status()
+            .map_err(|e| format!("git fetch failed: {e}"))?;
+        if !status.success() {
+            return Err(format!("git fetch failed in {}", dir.display()));
         }
-    } else if offline {
-        return Err(format!(
-            "--offline: git source {url} is not present in .scarlet/cache/git"
-        ));
     } else {
         if let Some(parent) = dir.parent() {
             fs::create_dir_all(parent).map_err(|e| format!("failed to create cache dir: {e}"))?;
@@ -1239,32 +1209,6 @@ fn git_ensure_checkout(
     Ok(dir)
 }
 
-fn git_resolve_cached_rev(url: &str, refspec: &str, cache_base: &Path) -> Result<String, String> {
-    let dir = git_cache_dir_for_url(url, cache_base);
-    if !dir.join(".git").exists() {
-        return Err(format!(
-            "--offline: git source {url} is not present in .scarlet/cache/git"
-        ));
-    }
-    let output = Command::new("git")
-        .args(["rev-parse", "--verify", &format!("{refspec}^{{commit}}")])
-        .current_dir(&dir)
-        .output()
-        .map_err(|error| format!("failed to inspect cached git source: {error}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "--offline: cached git source {url} does not contain reference {refspec}"
-        ));
-    }
-    let rev = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if !is_full_git_commit_id(&rev) {
-        return Err(format!(
-            "--offline: cached git source {url} resolved invalid revision {rev}"
-        ));
-    }
-    Ok(rev)
-}
-
 fn git_current_rev(dir: &Path) -> Result<String, String> {
     let output = Command::new("git")
         .args(["rev-parse", "HEAD"])
@@ -1285,7 +1229,6 @@ fn resolve_git_source(
     source: &PackageSource,
     cache_dir: &Path,
     locked_rev: Option<String>,
-    offline: bool,
 ) -> Result<(PathBuf, String), String> {
     let PackageSource::Git {
         git,
@@ -1308,8 +1251,6 @@ fn resolve_git_source(
             .unwrap_or("HEAD");
         let resolved_rev = if is_full_git_commit_id(refspec) {
             refspec.to_string()
-        } else if offline {
-            git_resolve_cached_rev(git, refspec, cache_dir)?
         } else {
             git_resolve_rev(git, refspec)?
         };
@@ -1319,7 +1260,7 @@ fn resolve_git_source(
         );
         resolved_rev
     };
-    let checkout_dir = git_ensure_checkout(git, &resolved_rev, cache_dir, offline)?;
+    let checkout_dir = git_ensure_checkout(git, &resolved_rev, cache_dir)?;
     Ok((checkout_dir, resolved_rev))
 }
 
@@ -1331,7 +1272,6 @@ fn resolve_git_sources(
     expanded: &mut ExpandedManifest,
     project: &Path,
     existing_lock: &ImageLock,
-    offline: bool,
 ) -> Result<(), String> {
     let cache_dir = project.join(".scarlet/cache/git");
     for (section_name, section) in expanded.sections.iter_mut() {
@@ -1351,8 +1291,7 @@ fn resolve_git_sources(
                         .find(|p| package_lock_matches_input(project, p, pkg).unwrap_or(false))
                 })
                 .and_then(|p| p.resolved_rev.clone());
-            let (checkout_dir, resolved_rev) =
-                resolve_git_source(source, &cache_dir, locked_rev, offline)?;
+            let (checkout_dir, resolved_rev) = resolve_git_source(source, &cache_dir, locked_rev)?;
             pkg.local_source = Some(checkout_dir);
             pkg.resolved_rev = Some(resolved_rev);
         }
@@ -1415,40 +1354,20 @@ fn resolve_section(
     base_dir: &Path,
     ctx: &TemplateContext,
     images: &BTreeMap<String, ManifestImageSection>,
-    offline: bool,
 ) -> Result<ResolvedSection, String> {
-    let layers = resolve_layers_with_offline(&section.layers, base_dir, ctx, images, offline)?;
+    let layers = resolve_layers(&section.layers, base_dir, ctx, images)?;
     Ok(ResolvedSection { layers })
 }
 
-#[cfg(test)]
 fn resolve_layers(
     layers: &[ManifestLayer],
     base_dir: &Path,
     ctx: &TemplateContext,
     images: &BTreeMap<String, ManifestImageSection>,
 ) -> Result<Vec<ResolvedLayer>, String> {
-    resolve_layers_with_offline(layers, base_dir, ctx, images, false)
-}
-
-fn resolve_layers_with_offline(
-    layers: &[ManifestLayer],
-    base_dir: &Path,
-    ctx: &TemplateContext,
-    images: &BTreeMap<String, ManifestImageSection>,
-    offline: bool,
-) -> Result<Vec<ResolvedLayer>, String> {
     let mut resolved = Vec::new();
     let git_cache_dir = base_dir.join(".scarlet/cache/git");
-    resolve_layers_into(
-        &mut resolved,
-        layers,
-        base_dir,
-        ctx,
-        images,
-        &git_cache_dir,
-        offline,
-    )?;
+    resolve_layers_into(&mut resolved, layers, base_dir, ctx, images, &git_cache_dir)?;
     Ok(resolved)
 }
 
@@ -1459,11 +1378,10 @@ fn resolve_bundle_path(
     bundle: Option<&str>,
     base_dir: &Path,
     git_cache_dir: &Path,
-    offline: bool,
 ) -> Result<PathBuf, String> {
     match source {
         Some(source @ PackageSource::Git { .. }) => {
-            let (checkout_dir, _) = resolve_git_source(source, git_cache_dir, None, offline)
+            let (checkout_dir, _) = resolve_git_source(source, git_cache_dir, None)
                 .map_err(|error| format!("failed to resolve git bundle source: {error}"))?;
             let subdir = Path::new(subdir.unwrap_or(""));
             let bundle = Path::new(bundle.unwrap_or("bundle.toml"));
@@ -1492,7 +1410,6 @@ fn resolve_layers_into(
     ctx: &TemplateContext,
     images: &BTreeMap<String, ManifestImageSection>,
     git_cache_dir: &Path,
-    offline: bool,
 ) -> Result<(), String> {
     for layer in layers {
         match layer {
@@ -1512,7 +1429,6 @@ fn resolve_layers_into(
                     bundle.as_deref(),
                     base_dir,
                     git_cache_dir,
-                    offline,
                 )?;
                 let bundle_dir = bundle_path.parent().unwrap_or(Path::new("."));
                 let text = fs::read_to_string(&bundle_path)
@@ -1527,7 +1443,6 @@ fn resolve_layers_into(
                     ctx,
                     images,
                     git_cache_dir,
-                    offline,
                 )?;
             }
             ManifestLayer::Copy {
@@ -1638,10 +1553,7 @@ fn resolve_layers_into(
     Ok(())
 }
 
-fn expand_manifest_with_offline(
-    project_dir: &Path,
-    offline: bool,
-) -> Result<ExpandedManifest, String> {
+fn expand_manifest(project_dir: &Path) -> Result<ExpandedManifest, String> {
     let manifest = load_manifest(project_dir)?;
     let bsp = manifest_bsp_config(&manifest, project_dir)?;
     let target_triple = target_triple_from_build_target(&bsp.build_target)?;
@@ -1663,7 +1575,7 @@ fn expand_manifest_with_offline(
     for (name, section) in images_ref {
         sections.insert(
             name.clone(),
-            resolve_section(section, project_dir, &ctx, images_ref, offline)?,
+            resolve_section(section, project_dir, &ctx, images_ref)?,
         );
     }
 
@@ -1675,14 +1587,7 @@ fn expand_manifest_with_offline(
 }
 
 fn generate_from_manifest(project_dir: &Path) -> Result<ExpandedManifest, String> {
-    generate_from_manifest_with_offline(project_dir, false)
-}
-
-fn generate_from_manifest_with_offline(
-    project_dir: &Path,
-    offline: bool,
-) -> Result<ExpandedManifest, String> {
-    let expanded = expand_manifest_with_offline(project_dir, offline)?;
+    let expanded = expand_manifest(project_dir)?;
 
     let generated_root = project_dir.join(".scarlet/scarlet-modules");
     let generated_src = generated_root.join("src");
@@ -1906,12 +1811,10 @@ fn sha256_dir_recursive(dir: &Path, hasher: &mut Sha256) -> Result<(), String> {
     Ok(())
 }
 
-fn cmd_update(project: &Path, offline: bool) -> Result<(), String> {
-    let mut expanded = expand_manifest_with_offline(project, offline)?;
-    if !offline {
-        let bsp = manifest_bsp_config(&expanded.manifest, project)?;
-        refresh_bsp_lock(project, &bsp.root, offline)?;
-    }
+fn cmd_update(project: &Path) -> Result<(), String> {
+    let mut expanded = expand_manifest(project)?;
+    let bsp = manifest_bsp_config(&expanded.manifest, project)?;
+    refresh_bsp_lock(project, &bsp.root)?;
     let git_cache_dir = project.join(".scarlet/cache/git");
     let file_cache_dir = project.join(".scarlet/cache/files");
     let mut lock = load_lock(project);
@@ -1921,7 +1824,7 @@ fn cmd_update(project: &Path, offline: bool) -> Result<(), String> {
             if let Some(ref src) = pkg.source
                 && src.is_git()
             {
-                let (checkout, rev) = resolve_git_source(src, &git_cache_dir, None, offline)?;
+                let (checkout, rev) = resolve_git_source(src, &git_cache_dir, None)?;
                 pkg.local_source = Some(checkout);
                 pkg.resolved_rev = Some(rev.clone());
             }
@@ -1955,12 +1858,8 @@ fn cmd_update(project: &Path, offline: bool) -> Result<(), String> {
                                     .find(|lock| lock.source == *url)
                             })
                             .map(|lock| lock.hash);
-                        let (_, hash) = fetch_url_cached_with_offline(
-                            url,
-                            &file_cache_dir,
-                            previous_hash.as_deref(),
-                            offline,
-                        )?;
+                        let (_, hash) =
+                            fetch_url_cached(url, &file_cache_dir, previous_hash.as_deref())?;
                         layers.push(LayerLock::Copy {
                             source: url.clone(),
                             to: file.to.clone(),
@@ -1970,12 +1869,7 @@ fn cmd_update(project: &Path, offline: bool) -> Result<(), String> {
                     }
                 }
                 ResolvedLayer::Archive(archive) => {
-                    fetch_archive_by_sha256(
-                        &archive.url,
-                        &archive.sha256,
-                        &file_cache_dir,
-                        offline,
-                    )?;
+                    fetch_archive_by_sha256(&archive.url, &archive.sha256, &file_cache_dir)?;
                     layers.push(LayerLock::Archive {
                         source: LockPackageSource::archive(
                             archive.url.clone(),
@@ -2040,7 +1934,6 @@ fn run() -> Result<(), String> {
                 "check",
                 &[],
                 false,
-                false,
             )
         }
         Commands::Build {
@@ -2050,7 +1943,6 @@ fn run() -> Result<(), String> {
             module,
             output,
             locked,
-            offline,
         } => {
             if let Some(module_path) = module {
                 build_loadable_module(&module_path, target.as_deref(), output.as_deref(), release)?;
@@ -2058,7 +1950,7 @@ fn run() -> Result<(), String> {
             } else {
                 let project = project.ok_or("--project is required when not using --lsm")?;
                 let project = normalize_project_path(&project)?;
-                let expanded = generate_from_manifest_with_offline(&project, offline)?;
+                let expanded = generate_from_manifest(&project)?;
                 if locked {
                     validate_locked_archive_layers(&expanded, &load_lock(&project))?;
                 }
@@ -2070,7 +1962,6 @@ fn run() -> Result<(), String> {
                     "build",
                     &[],
                     locked,
-                    offline,
                 )?;
                 inject_ksym_section_manifest(&project, &expanded, target.as_deref(), release)
             }
@@ -2091,7 +1982,6 @@ fn run() -> Result<(), String> {
                 "clippy",
                 &extra_args,
                 false,
-                false,
             )
         }
         Commands::Run {
@@ -2100,17 +1990,16 @@ fn run() -> Result<(), String> {
             release,
             no_image,
             locked,
-            offline,
             extra_args,
         } => {
             let project = normalize_project_path(&project)?;
-            let expanded = generate_from_manifest_with_offline(&project, offline)?;
+            let expanded = generate_from_manifest(&project)?;
             if locked {
                 validate_locked_archive_layers(&expanded, &load_lock(&project))?;
             }
 
             if !no_image {
-                build_manifest_image(&project, target, release, None, false, locked, offline)?;
+                build_manifest_image(&project, target, release, None, false, locked)?;
             }
 
             match &expanded.manifest.runner {
@@ -2150,12 +2039,9 @@ fn run() -> Result<(), String> {
             kernel_elf,
             no_build,
             locked,
-            offline,
         } => {
             let project = normalize_project_path(&project)?;
-            build_manifest_image(
-                &project, target, release, kernel_elf, no_build, locked, offline,
-            )
+            build_manifest_image(&project, target, release, kernel_elf, no_build, locked)
         }
         Commands::New {
             module,
@@ -2170,14 +2056,13 @@ fn run() -> Result<(), String> {
             kernel_rev.as_deref(),
             target.as_deref(),
         ),
-        Commands::Update { project, offline } => {
+        Commands::Update { project } => {
             let project = normalize_project_path(&project)?;
-            cmd_update(&project, offline)
+            cmd_update(&project)
         }
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn cargo_build_manifest(
     project: &Path,
     expanded: &ExpandedManifest,
@@ -2186,7 +2071,6 @@ fn cargo_build_manifest(
     subcommand: &str,
     extra_args: &[String],
     locked: bool,
-    offline: bool,
 ) -> Result<(), String> {
     let bsp = manifest_bsp_config(&expanded.manifest, project)?;
     let resolved_target = target
@@ -2205,15 +2089,15 @@ fn cargo_build_manifest(
     // Refresh git dependencies in the BSP Cargo.lock before building.
     // Without this, `cargo scarlet image` silently reuses the kernel
     // revision pinned in the BSP lock file even when the manifest points
-    // at a branch whose tip has advanced. Skip when --locked (explicit
-    // freeze) or --offline (no network).
+    // at a branch whose tip has advanced. Skip this explicit refresh
+    // when --locked is requested.
     //
     // Note: do NOT pass --workspace here. The BSP depends on the kernel
     // through a generated path dependency (`.scarlet/scarlet-modules`),
     // and `cargo update --workspace` leaves git dependencies reachable
     // only through path dependencies untouched.
-    if !locked && !offline {
-        refresh_bsp_lock(project, &bsp.root, offline)?;
+    if !locked {
+        refresh_bsp_lock(project, &bsp.root)?;
     }
 
     let mut command = project_cargo_command(project);
@@ -2254,10 +2138,7 @@ fn cargo_build_manifest(
 /// Run `cargo update` in the BSP so git dependencies such as the
 /// kernel revision are not stuck at whatever was pinned in the BSP's
 /// Cargo.lock on the very first build.
-fn refresh_bsp_lock(project: &Path, bsp_root: &Path, offline: bool) -> Result<(), String> {
-    if offline {
-        return Ok(());
-    }
+fn refresh_bsp_lock(project: &Path, bsp_root: &Path) -> Result<(), String> {
     let mut update_cmd = project_cargo_command(project);
     update_cmd.arg("update");
     update_cmd.current_dir(bsp_root);
@@ -2395,9 +2276,8 @@ fn build_manifest_image(
     kernel_elf: Option<PathBuf>,
     no_build: bool,
     locked: bool,
-    offline: bool,
 ) -> Result<(), String> {
-    let mut expanded = generate_from_manifest_with_offline(project, offline)?;
+    let mut expanded = generate_from_manifest(project)?;
     let existing_lock = load_lock(project);
     if locked {
         validate_locked_archive_layers(&expanded, &existing_lock)?;
@@ -2412,7 +2292,6 @@ fn build_manifest_image(
             "build",
             &[],
             locked,
-            offline,
         )?;
         inject_ksym_section_manifest(project, &expanded, target.as_deref(), release)?;
     }
@@ -2461,7 +2340,7 @@ fn build_manifest_image(
 
     let build_order = topo_sort_images(&expanded.manifest.images)?;
 
-    resolve_git_sources(&mut expanded, project, &existing_lock, offline)?;
+    resolve_git_sources(&mut expanded, project, &existing_lock)?;
     let mut new_lock = ImageLock::default();
 
     for section_name in build_order {
@@ -2507,7 +2386,6 @@ fn build_manifest_image(
                                 &cache_dir,
                                 prev_section_lock,
                                 &tpl_ctx,
-                                offline,
                                 &mut layer_locks,
                             )?;
                         }
@@ -2516,7 +2394,6 @@ fn build_manifest_image(
                                 archive,
                                 &staging_dir,
                                 &cache_dir,
-                                offline,
                                 &mut layer_locks,
                             )?;
                         }
@@ -3498,37 +3375,10 @@ fn fetch_url_cached(
     Ok((cached_path, actual_hash))
 }
 
-fn cached_url_path(url: &str, cache_dir: &Path) -> PathBuf {
-    use std::hash::{Hash, Hasher};
-
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    url.hash(&mut hasher);
-    let hash = format!("{:016x}", hasher.finish());
-    let url_path = url.split('?').next().unwrap_or(url);
-    let basename = url_path.rsplit('/').next().unwrap_or("download");
-    cache_dir.join(format!("{}-{}", &hash[..12], basename))
-}
-
-fn fetch_url_cached_with_offline(
-    url: &str,
-    cache_dir: &Path,
-    expected_hash: Option<&str>,
-    offline: bool,
-) -> Result<(PathBuf, String), String> {
-    let cached_path = cached_url_path(url, cache_dir);
-    if offline && !cached_path.exists() {
-        return Err(format!(
-            "--offline: file {url} is not present in .scarlet/cache/files"
-        ));
-    }
-    fetch_url_cached(url, cache_dir, expected_hash)
-}
-
 fn fetch_archive_by_sha256(
     url: &str,
     expected_sha256: &str,
     cache_dir: &Path,
-    offline: bool,
 ) -> Result<PathBuf, String> {
     let expected_sha256 = normalize_sha256(expected_sha256)?;
     let hash = expected_sha256
@@ -3544,12 +3394,6 @@ fn fetch_archive_by_sha256(
             ));
         }
         return Ok(cached_path);
-    }
-
-    if offline {
-        return Err(format!(
-            "--offline: archive {expected_sha256} is not present in .scarlet/cache/files; run without --offline or run `cargo scarlet update`"
-        ));
     }
 
     fs::create_dir_all(cache_dir).map_err(|error| {
@@ -3951,10 +3795,9 @@ fn apply_archive_layer(
     archive: &ResolvedArchive,
     staging_dir: &Path,
     cache_dir: &Path,
-    offline: bool,
     layer_locks: &mut Vec<LayerLock>,
 ) -> Result<(), String> {
-    let archive_path = fetch_archive_by_sha256(&archive.url, &archive.sha256, cache_dir, offline)?;
+    let archive_path = fetch_archive_by_sha256(&archive.url, &archive.sha256, cache_dir)?;
     let dest_root = archive_destination(staging_dir, &archive.to)?;
     extract_archive_safe(
         &archive_path,
@@ -3978,7 +3821,6 @@ fn apply_copy_layer(
     cache_dir: &Path,
     prev_section_lock: Option<&SectionLock>,
     tpl_ctx: &TemplateContext,
-    offline: bool,
     layer_locks: &mut Vec<LayerLock>,
 ) -> Result<(), String> {
     let local_path = match &file.source {
@@ -3989,8 +3831,7 @@ fn apply_copy_layer(
                     .find(|lock| copy_lock_matches_input(lock, file))
                     .map(|lock| lock.hash)
             });
-            let (path, hash) =
-                fetch_url_cached_with_offline(u, cache_dir, expected.as_deref(), offline)?;
+            let (path, hash) = fetch_url_cached(u, cache_dir, expected.as_deref())?;
             layer_locks.push(LayerLock::Copy {
                 source: u.clone(),
                 to: file.to.clone(),
@@ -5519,6 +5360,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cli_rejects_removed_offline_option() {
+        for subcommand in ["build", "run", "image", "update"] {
+            let error = Cli::try_parse_from([
+                "cargo-scarlet",
+                subcommand,
+                "--project",
+                "project",
+                "--offline",
+            ])
+            .unwrap_err();
+            assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+        }
+    }
+
+    #[test]
+    fn cli_keeps_project_locked_option() {
+        for subcommand in ["build", "run", "image"] {
+            let cli = Cli::try_parse_from([
+                "cargo-scarlet",
+                subcommand,
+                "--project",
+                "project",
+                "--locked",
+            ])
+            .unwrap();
+            assert!(matches!(
+                cli.command,
+                Commands::Build { locked: true, .. }
+                    | Commands::Run { locked: true, .. }
+                    | Commands::Image { locked: true, .. }
+            ));
+        }
+    }
+
+    #[test]
     fn cli_new_accepts_lsm_name() {
         let cli = Cli::try_parse_from(["cargo-scarlet", "new", "--lsm", "my-module"]).unwrap();
 
@@ -6198,16 +6074,7 @@ to = "/system/scarlet/bin/video_player"
         };
         let mut layer_locks = Vec::new();
 
-        apply_copy_layer(
-            &file,
-            &staging,
-            &cache,
-            None,
-            &tpl_ctx,
-            false,
-            &mut layer_locks,
-        )
-        .unwrap();
+        apply_copy_layer(&file, &staging, &cache, None, &tpl_ctx, &mut layer_locks).unwrap();
 
         assert!(staging.join("data/config/system/linux-aarch64").is_dir());
         let _ = fs::remove_dir_all(&temp);
@@ -7099,18 +6966,20 @@ to = "/system"
     }
 
     #[test]
-    fn test_fetch_archive_by_sha256_offline_miss() {
-        let temp = archive_test_dir("archive-offline-miss");
-        let expected = sha256_bytes(b"archive");
-        let error = fetch_archive_by_sha256(
-            "https://example.com/rootfs.tar",
-            &expected,
-            &temp.join("cache"),
-            true,
-        )
-        .expect_err("offline cache miss must fail");
-        assert!(error.contains("--offline: archive"));
-        assert!(error.contains(&expected));
+    fn test_fetch_archive_by_sha256_populates_missing_cache() {
+        let temp = archive_test_dir("archive-cache-miss");
+        let bytes = b"archive input";
+        let source = temp.join("source.tar");
+        fs::write(&source, bytes).unwrap();
+        let expected = sha256_bytes(bytes);
+        let cache = temp.join("cache");
+
+        let path =
+            fetch_archive_by_sha256(&format!("file://{}", source.display()), &expected, &cache)
+                .unwrap();
+
+        assert_eq!(path, cache.join(expected.strip_prefix("sha256:").unwrap()));
+        assert_eq!(fs::read(path).unwrap(), bytes);
         fs::remove_dir_all(&temp).unwrap();
     }
 
@@ -7126,7 +6995,6 @@ to = "/system"
             "https://127.0.0.1:9/must-not-be-requested.tar",
             &expected,
             &cache,
-            false,
         )
         .unwrap();
         assert_eq!(fs::read(path).unwrap(), bytes);
@@ -7144,9 +7012,8 @@ to = "/system"
             b"tampered archive",
         )
         .unwrap();
-        let error =
-            fetch_archive_by_sha256("https://example.com/rootfs.tar", &expected, &cache, true)
-                .expect_err("mismatched cached archive must fail");
+        let error = fetch_archive_by_sha256("https://example.com/rootfs.tar", &expected, &cache)
+            .expect_err("mismatched cached archive must fail");
         assert!(error.contains("archive SHA-256 mismatch"));
         fs::remove_dir_all(&temp).unwrap();
     }
@@ -7218,7 +7085,7 @@ to = "/system"
         };
         let staging = temp.join("staging");
         let mut locks = Vec::new();
-        apply_archive_layer(&archive, &staging, &temp.join("cache"), false, &mut locks).unwrap();
+        apply_archive_layer(&archive, &staging, &temp.join("cache"), &mut locks).unwrap();
         assert_eq!(
             fs::read(staging.join("system/foo/etc/issue")).unwrap(),
             b"Scarlet\n"
