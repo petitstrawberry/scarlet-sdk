@@ -52,7 +52,7 @@
           ];
           cargo-scarlet-plugin-limine = rustPlatform.buildRustPackage {
             pname = "cargo-scarlet-plugin-limine";
-            version = "0.1.0";
+            version = "1.0.0";
             inherit src;
             buildAndTestSubdir = "cargo-scarlet-plugin-limine";
             cargoLock.lockFile = ./Cargo.lock;
@@ -72,7 +72,7 @@
           ++ imageTools;
           cargo-scarlet = rustPlatform.buildRustPackage {
             pname = "cargo-scarlet";
-            version = "0.1.0";
+            version = "1.0.0";
             inherit src;
             buildAndTestSubdir = "cargo-scarlet";
             cargoLock.lockFile = ./Cargo.lock;
