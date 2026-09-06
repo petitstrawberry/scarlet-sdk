@@ -27,7 +27,8 @@ enum Commands {
         target: Option<String>,
         #[arg(long)]
         release: bool,
-        #[arg(long)]
+        /// Build a loadable Scarlet module (.lsm) instead of a project.
+        #[arg(long = "lsm", value_name = "PATH")]
         module: Option<PathBuf>,
         #[arg(long)]
         output: Option<PathBuf>,
@@ -87,7 +88,8 @@ enum Commands {
         offline: bool,
     },
     New {
-        #[arg(long)]
+        /// Scaffold a loadable Scarlet module (LSM).
+        #[arg(long = "lsm", value_name = "NAME")]
         module: Option<String>,
         #[arg(long)]
         project: Option<String>,
@@ -956,32 +958,21 @@ fn load_manifest(project_dir: &Path) -> Result<ScarletManifest, String> {
 }
 
 fn merge_toml_into(parent: &mut toml::Value, child: toml::Value) {
-    let toml::Value::Table(parent_table) = parent else {
-        return;
-    };
-    let toml::Value::Table(child_table) = child else {
-        return;
-    };
-    for (key, child_val) in child_table {
-        match parent_table.get_mut(&key) {
-            Some(toml::Value::Array(parent_arr)) => {
-                if let toml::Value::Array(child_arr) = child_val {
-                    parent_arr.extend(child_arr);
+    match (parent, child) {
+        (toml::Value::Table(parent_table), toml::Value::Table(child_table)) => {
+            for (key, child_val) in child_table {
+                match parent_table.get_mut(&key) {
+                    Some(parent_existing) => merge_toml_into(parent_existing, child_val),
+                    None => {
+                        parent_table.insert(key, child_val);
+                    }
                 }
-            }
-            Some(parent_existing) => {
-                let child_tables = matches!(parent_existing, toml::Value::Table(_))
-                    && matches!(&child_val, toml::Value::Table(_));
-                if child_tables {
-                    let mut taken = parent_existing.clone();
-                    merge_toml_into(&mut taken, child_val);
-                    parent_table.insert(key, taken);
-                }
-            }
-            _ => {
-                parent_table.insert(key, child_val);
             }
         }
+        (toml::Value::Array(parent_arr), toml::Value::Array(child_arr)) => {
+            parent_arr.extend(child_arr);
+        }
+        (parent, child) => *parent = child,
     }
 }
 
@@ -2065,7 +2056,7 @@ fn run() -> Result<(), String> {
                 build_loadable_module(&module_path, target.as_deref(), output.as_deref(), release)?;
                 Ok(())
             } else {
-                let project = project.ok_or("--project is required when not using --module")?;
+                let project = project.ok_or("--project is required when not using --lsm")?;
                 let project = normalize_project_path(&project)?;
                 let expanded = generate_from_manifest_with_offline(&project, offline)?;
                 if locked {
@@ -4895,7 +4886,7 @@ fn build_loadable_module(
     output: Option<&Path>,
     release: bool,
 ) -> Result<(), String> {
-    let target = target.ok_or("--target is required when using --module")?;
+    let target = target.ok_or("--target is required when using --lsm")?;
     let module_dir = fs::canonicalize(module_path).map_err(|e| {
         format!(
             "failed to resolve module path {}: {e}",
@@ -5109,8 +5100,8 @@ fn new_scaffold(
     match (module, project) {
         (Some(name), None) => scaffold_module(&name, kernel_path, kernel_rev),
         (None, Some(name)) => scaffold_project(&name, kernel_path, kernel_rev, target),
-        (Some(_), Some(_)) => Err("cannot specify both --module and --project".to_string()),
-        (None, None) => Err("specify --module or --project".to_string()),
+        (Some(_), Some(_)) => Err("cannot specify both --lsm and --project".to_string()),
+        (None, None) => Err("specify --lsm or --project".to_string()),
     }
 }
 
@@ -5528,6 +5519,156 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cli_new_accepts_lsm_name() {
+        let cli = Cli::try_parse_from(["cargo-scarlet", "new", "--lsm", "my-module"]).unwrap();
+
+        match cli.command {
+            Commands::New { module, .. } => assert_eq!(module.as_deref(), Some("my-module")),
+            _ => panic!("expected new command"),
+        }
+    }
+
+    #[test]
+    fn cli_build_accepts_lsm_path() {
+        let cli = Cli::try_parse_from([
+            "cargo-scarlet",
+            "build",
+            "--lsm",
+            "modules/my-module",
+            "--target",
+            "targets/riscv64gc-unknown-none-elf.json",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::Build { module, target, .. } => {
+                assert_eq!(module.as_deref(), Some(Path::new("modules/my-module")));
+                assert_eq!(
+                    target.as_deref(),
+                    Some("targets/riscv64gc-unknown-none-elf.json")
+                );
+            }
+            _ => panic!("expected build command"),
+        }
+    }
+
+    #[test]
+    fn cli_help_names_the_loadable_module_option_lsm() {
+        for subcommand in ["new", "build"] {
+            let help = Cli::try_parse_from(["cargo-scarlet", subcommand, "--help"])
+                .unwrap_err()
+                .to_string();
+            assert!(help.contains("--lsm"));
+            assert!(!help.contains("--module"));
+        }
+    }
+
+    #[test]
+    fn local_overrides_replace_scalars_and_preserve_other_keys() {
+        let mut manifest: toml::Value = toml::from_str(
+            r#"
+schema_version = 1
+
+[project]
+name = "base"
+
+[kernel.features]
+network = true
+hypervisor = true
+
+[runner]
+command = "base-runner"
+"#,
+        )
+        .unwrap();
+        let overrides = toml::from_str(
+            r#"
+schema_version = 2
+
+[kernel.features]
+network = false
+profiler = true
+
+[runner]
+command = "local-runner"
+"#,
+        )
+        .unwrap();
+
+        merge_toml_into(&mut manifest, overrides);
+
+        assert_eq!(manifest["project"]["name"].as_str(), Some("base"));
+        assert_eq!(
+            manifest["kernel"]["features"]["network"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            manifest["kernel"]["features"]["hypervisor"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            manifest["kernel"]["features"]["profiler"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(manifest["runner"]["command"].as_str(), Some("local-runner"));
+        assert_eq!(manifest["schema_version"].as_integer(), Some(2));
+    }
+
+    #[test]
+    fn local_overrides_append_arrays_in_order() {
+        let mut manifest: toml::Value = toml::from_str(
+            r#"
+[[images.rootfs.layers]]
+kind = "copy"
+source = "base"
+to = "/"
+"#,
+        )
+        .unwrap();
+        let overrides = toml::from_str(
+            r#"
+[[images.rootfs.layers]]
+kind = "copy"
+source = "local"
+to = "/"
+"#,
+        )
+        .unwrap();
+
+        merge_toml_into(&mut manifest, overrides);
+
+        let layers = manifest["images"]["rootfs"]["layers"].as_array().unwrap();
+        assert_eq!(layers.len(), 2);
+        assert_eq!(layers[0]["source"].as_str(), Some("base"));
+        assert_eq!(layers[1]["source"].as_str(), Some("local"));
+    }
+
+    #[test]
+    fn local_overrides_can_change_kernel_feature_representation() {
+        let mut manifest: toml::Value = toml::from_str(
+            r#"
+[bsp.kernel]
+features = ["network"]
+"#,
+        )
+        .unwrap();
+        let overrides = toml::from_str(
+            r#"
+[bsp.kernel.features]
+network = false
+"#,
+        )
+        .unwrap();
+
+        merge_toml_into(&mut manifest, overrides);
+
+        assert_eq!(
+            manifest["bsp"]["kernel"]["features"]["network"].as_bool(),
+            Some(false)
+        );
+    }
+
+    #[test]
     fn cargo_commands_use_project_local_cargo_home() {
         let project = Path::new("/tmp/scarlet-project");
         let command = project_cargo_command(project);
@@ -5598,11 +5739,15 @@ args = ["--verify"]
         run_post_image_hook(&project, Some(&hook), "aarch64-unknown-scarlet", "release").unwrap();
 
         let output = fs::read_to_string(project.join("hook.out")).unwrap();
+        let (working_dir, context) = output.split_once('\n').unwrap();
         assert_eq!(
-            output,
+            fs::canonicalize(working_dir).unwrap(),
+            fs::canonicalize(&project).unwrap()
+        );
+        assert_eq!(
+            context,
             format!(
-                "{}\n{}\naarch64-unknown-scarlet\nrelease\nargument\n",
-                project.display(),
+                "{}\naarch64-unknown-scarlet\nrelease\nargument\n",
                 project.display()
             )
         );

@@ -165,8 +165,10 @@ This generates a loadable scarlet module with `Cargo.toml`, `module.toml`, `buil
 
 ```bash
 # Build the LSM
-cargo scarlet build --lsm my-module --target riscv64gc-unknown-none-elf
+cargo scarlet build --lsm my-module --target /path/to/kernel/targets/riscv64gc-unknown-none-elf.json
 ```
+
+For LSM builds, `--target` takes a target JSON file path.
 
 ## Commands
 
