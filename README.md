@@ -77,7 +77,7 @@ source = { git = "https://github.com/petitstrawberry/scarlet-ui" }
 subdir = "examples/widget-factory"
 package = "scarlet-ui-widget-factory"
 bin = "scarlet-ui-widget-factory"
-to = "/system/scarlet/bin/widget_factory"
+to = "/bin/widget-factory"
 ```
 
 ### Project-local caches
@@ -132,7 +132,7 @@ cargo scarlet new --project my-board --target riscv64gc-unknown-none-elf --kerne
 
 # Or with a git source (defaults to github.com/petitstrawberry/Scarlet)
 cargo scarlet new --project my-board --target riscv64gc-unknown-none-elf
-cargo scarlet new --project my-board --target riscv64gc-unknown-none-elf --kernel-rev v0.17.0
+cargo scarlet new --project my-board --target riscv64gc-unknown-none-elf --kernel-rev kernel-v1.0.0
 ```
 
 This generates:
