@@ -1812,7 +1812,7 @@ fn sha256_dir_recursive(dir: &Path, hasher: &mut Sha256) -> Result<(), String> {
 }
 
 fn cmd_update(project: &Path) -> Result<(), String> {
-    let mut expanded = expand_manifest(project)?;
+    let mut expanded = generate_from_manifest(project)?;
     let bsp = manifest_bsp_config(&expanded.manifest, project)?;
     refresh_bsp_lock(project, &bsp.root)?;
     let git_cache_dir = project.join(".scarlet/cache/git");
