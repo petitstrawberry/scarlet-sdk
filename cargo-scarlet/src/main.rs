@@ -1326,6 +1326,7 @@ fn userspace_target_triple(kernel_triple: &str) -> String {
     let arch = kernel_triple.split('-').next().unwrap_or("unknown");
     match arch {
         "aarch64" => "aarch64-unknown-scarlet".to_string(),
+        v if v.starts_with("riscv32") => "riscv32gc-unknown-scarlet".to_string(),
         v if v.starts_with("riscv64") => "riscv64gc-unknown-scarlet".to_string(),
         _ => kernel_triple.to_string(),
     }
@@ -1559,7 +1560,8 @@ fn expand_manifest(project_dir: &Path) -> Result<ExpandedManifest, String> {
     let target_triple = target_triple_from_build_target(&bsp.build_target)?;
     let raw_arch = target_triple.split('-').next().unwrap_or("unknown");
     let arch = match raw_arch {
-        "riscv64gc" => "riscv64".to_string(),
+        v if v.starts_with("riscv32") => "riscv32".to_string(),
+        v if v.starts_with("riscv64") => "riscv64".to_string(),
         other => other.to_string(),
     };
     let project = manifest.project.name.clone();
@@ -5358,6 +5360,73 @@ fn which(cmd: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn riscv_project_selects_architecture_assets_and_gc_userspace() {
+        for (target, arch, userspace) in [
+            (
+                "riscv32ima-unknown-none-elf",
+                "riscv32",
+                "riscv32gc-unknown-scarlet",
+            ),
+            (
+                "riscv32gc-unknown-none-elf",
+                "riscv32",
+                "riscv32gc-unknown-scarlet",
+            ),
+            (
+                "riscv64imac-unknown-none-elf",
+                "riscv64",
+                "riscv64gc-unknown-scarlet",
+            ),
+            (
+                "riscv64gc-unknown-none-elf",
+                "riscv64",
+                "riscv64gc-unknown-scarlet",
+            ),
+        ] {
+            let project = std::env::temp_dir().join(format!(
+                "cargo-scarlet-riscv-project-{}-{target}",
+                std::process::id()
+            ));
+            fs::create_dir_all(project.join("bsp/.cargo")).unwrap();
+            fs::write(
+                project.join("bsp/.cargo/config.toml"),
+                format!("[build]\ntarget = \"targets/{target}.json\"\n"),
+            )
+            .unwrap();
+            fs::write(
+                project.join("scarlet.toml"),
+                r#"
+schema_version = 2
+[project]
+name = "riscv-project"
+[bsp]
+path = "bsp"
+package = "scarlet"
+[bsp.kernel]
+source = { path = "kernel" }
+[images.rootfs]
+format = "newc"
+[[images.rootfs.layers]]
+kind = "copy"
+source = "assets/{arch}"
+to = "/"
+"#,
+            )
+            .unwrap();
+            let expanded = expand_manifest(&project).unwrap();
+            let ResolvedLayer::Copy(file) = &expanded.sections["rootfs"].layers[0] else {
+                panic!("expected architecture-specific assets");
+            };
+            let FileSource::Local(path) = &file.source else {
+                panic!("expected local assets");
+            };
+            assert_eq!(path, &project.join("assets").join(arch));
+            assert_eq!(userspace_target_triple(target), userspace);
+            fs::remove_dir_all(project).unwrap();
+        }
+    }
 
     #[test]
     fn cli_rejects_removed_offline_option() {
