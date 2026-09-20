@@ -172,6 +172,8 @@ struct ScarletManifest {
     #[allow(dead_code)]
     project: ManifestProject,
     #[serde(default)]
+    userspace: ManifestUserspace,
+    #[serde(default)]
     bsp: Option<ManifestBsp>,
     #[serde(default)]
     kernel: Option<ManifestKernel>,
@@ -207,6 +209,14 @@ struct ManifestRunner {
 #[allow(dead_code)]
 struct ManifestProject {
     name: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ManifestUserspace {
+    /// Cargo configuration shared by every userspace package build. This is
+    /// separate from the BSP's kernel target and linker configuration.
+    #[serde(default, rename = "cargo-config")]
+    cargo_config: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1156,6 +1166,23 @@ fn project_cargo_command(project: &Path) -> Command {
     let mut command = Command::new("cargo");
     command.env("CARGO_HOME", project_cargo_home(project));
     command
+}
+
+fn userspace_cargo_config(project: &Path) -> Result<Option<PathBuf>, String> {
+    let manifest = load_manifest(project)?;
+    let Some(path) = manifest.userspace.cargo_config else {
+        return Ok(None);
+    };
+    let config = resolve_path(project, &path);
+    if !config.is_file() {
+        return Err(format!(
+            "userspace Cargo config does not exist: {}",
+            config.display()
+        ));
+    }
+    fs::canonicalize(&config)
+        .map(Some)
+        .map_err(|e| format!("failed to resolve {}: {e}", config.display()))
 }
 
 fn package_cargo_target_dir(project: &Path, package_root: &Path) -> PathBuf {
@@ -4021,6 +4048,9 @@ fn install_package(
                     package_name, bin_name, userspace_triple
                 );
                 let mut cmd = project_cargo_command(project);
+                if let Some(config) = userspace_cargo_config(project)? {
+                    cmd.arg("--config").arg(config);
+                }
                 cmd.arg("build");
                 if profile == "release" {
                     cmd.arg("--release");
@@ -5360,6 +5390,28 @@ fn which(cmd: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn userspace_cargo_config_is_resolved_from_project() {
+        let project = std::env::temp_dir().join(format!(
+            "cargo-scarlet-userspace-config-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(project.join(".cargo")).unwrap();
+        fs::write(
+            project.join("scarlet.toml"),
+            "schema_version = 2\n[project]\nname = \"test\"\n[userspace]\ncargo-config = \".cargo/userspace.toml\"\n",
+        )
+        .unwrap();
+        let config = project.join(".cargo/userspace.toml");
+        assert!(userspace_cargo_config(&project).is_err());
+        fs::write(&config, "[target.aarch64-unknown-scarlet]\n").unwrap();
+        assert_eq!(
+            userspace_cargo_config(&project).unwrap(),
+            Some(fs::canonicalize(config).unwrap())
+        );
+        fs::remove_dir_all(project).unwrap();
+    }
 
     #[test]
     fn riscv_project_selects_architecture_assets_and_gc_userspace() {
@@ -6709,6 +6761,7 @@ to = "/"
                 project: ManifestProject {
                     name: "test".to_string(),
                 },
+                userspace: ManifestUserspace::default(),
                 bsp: None,
                 kernel: None,
                 modules: BTreeMap::new(),

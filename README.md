@@ -165,6 +165,18 @@ Aggregation source/manifest files under `.scarlet/` are generated: change the
 source manifest instead. Its `.cargo/config.toml` is initialized only when
 absent, so project-specific settings are retained.
 
+For a project with userspace packages in several source directories, declare a
+checked-in Cargo config in `scarlet.toml`:
+
+```toml
+[userspace]
+cargo-config = ".cargo/userspace.toml"
+```
+
+`cargo scarlet image` passes this file with `cargo --config` to every userspace
+package build. Put userspace patches or target flags there; BSP kernel target,
+linker, and `build-std` settings stay in the BSP's own `.cargo/config.toml`.
+
 Then build and run:
 
 ```bash
