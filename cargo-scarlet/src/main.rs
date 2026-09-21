@@ -348,6 +348,8 @@ enum ManifestLayer {
         default_features: Option<bool>,
         #[serde(default, skip_serializing_if = "is_false")]
         replace: bool,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        architectures: Vec<String>,
         to: String,
     },
     Script {
@@ -1520,8 +1522,13 @@ fn resolve_layers_into(
                 features,
                 default_features,
                 replace,
+                architectures,
                 to,
             } => {
+                if !architectures.is_empty() && !architectures.iter().any(|arch| arch == ctx.arch())
+                {
+                    continue;
+                }
                 let pkg = PackageLayerSpec {
                     kind: "cargo".to_string(),
                     source: Some(source.clone()),
@@ -5897,6 +5904,7 @@ to = "/system/scarlet/bin/video_player"
             features,
             default_features,
             replace,
+            architectures,
             ..
         } = &bundle.layers[0]
         else {
@@ -5905,6 +5913,7 @@ to = "/system/scarlet/bin/video_player"
 
         assert_eq!(default_features, &Some(false));
         assert!(*replace);
+        assert!(architectures.is_empty());
         assert_eq!(
             features,
             &vec!["h264-stateful-hw".to_string(), "mp4-aac".to_string()]
@@ -5931,6 +5940,39 @@ to = "/bin/widget-factory"
     }
 
     #[test]
+    fn cargo_layer_filters_by_target_architecture() {
+        let toml_str = r#"
+[[layers]]
+kind = "cargo"
+source = "user/scarlet-ld"
+package = "scarlet-ld"
+bin = "scarlet-ld"
+architectures = ["aarch64", "riscv64"]
+to = "/system/bin/scarlet-ld"
+"#;
+        let bundle: BundleManifest = toml::from_str(toml_str).unwrap();
+        let images = BTreeMap::new();
+
+        let aarch64 = TemplateContext {
+            arch: "aarch64".to_string(),
+            target_triple: "aarch64-unknown-none-elf".to_string(),
+            project: "test".to_string(),
+        };
+        let resolved =
+            resolve_layers(&bundle.layers, Path::new("/tmp/scarlet"), &aarch64, &images).unwrap();
+        assert_eq!(resolved.len(), 1);
+
+        let riscv32 = TemplateContext {
+            arch: "riscv32".to_string(),
+            target_triple: "riscv32imafdc-unknown-none-elf".to_string(),
+            project: "test".to_string(),
+        };
+        let resolved =
+            resolve_layers(&bundle.layers, Path::new("/tmp/scarlet"), &riscv32, &images).unwrap();
+        assert!(resolved.is_empty());
+    }
+
+    #[test]
     fn cargo_layer_replace_removes_previous_same_destination() {
         let layers = vec![
             ManifestLayer::Cargo {
@@ -5941,6 +5983,7 @@ to = "/bin/widget-factory"
                 features: vec!["h264-stateful-hw".to_string(), "mp4-aac".to_string()],
                 default_features: Some(false),
                 replace: false,
+                architectures: Vec::new(),
                 to: "/system/scarlet/bin/video_player".to_string(),
             },
             ManifestLayer::Cargo {
@@ -5955,6 +5998,7 @@ to = "/bin/widget-factory"
                 ],
                 default_features: Some(false),
                 replace: true,
+                architectures: Vec::new(),
                 to: "/system/scarlet/bin/video_player".to_string(),
             },
         ];
