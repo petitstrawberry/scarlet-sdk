@@ -80,6 +80,19 @@ bin = "scarlet-ui-widget-factory"
 to = "/system/scarlet/bin/widget_factory"
 ```
 
+Set `architectures` when a Cargo layer is only available for selected target
+architectures. The layer is omitted for other targets:
+
+```toml
+[[layers]]
+kind = "cargo"
+source = "../../user/scarlet-ld"
+package = "scarlet-ld"
+bin = "scarlet-ld"
+architectures = ["aarch64", "riscv64"]
+to = "/system/bin/scarlet-ld"
+```
+
 ### Project-local caches
 
 `cargo-scarlet` keeps build inputs and child Cargo state inside the project:
