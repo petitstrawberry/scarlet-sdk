@@ -9,6 +9,8 @@ use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+mod cache;
+
 #[derive(Parser, Debug)]
 #[command(name = "cargo-scarlet")]
 #[command(bin_name = "cargo-scarlet")]
@@ -97,6 +99,40 @@ enum Commands {
     Update {
         #[arg(long)]
         project: PathBuf,
+    },
+    /// Inspect and prune project-local caches.
+    Cache {
+        #[arg(long, global = true, default_value = ".")]
+        project: PathBuf,
+        #[command(subcommand)]
+        command: CacheCommands,
+    },
+    /// Remove the entire .scarlet directory, including images and guest data.
+    Clean {
+        #[arg(long, default_value = ".")]
+        project: PathBuf,
+        /// Show the directory and size without deleting anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum CacheCommands {
+    /// List .scarlet usage by size, purpose and last use (or estimated mtime).
+    List,
+    /// Remove isolated Cargo target caches; retain source inputs and images.
+    #[command(group(clap::ArgGroup::new("policy").required(true).multiple(true).args(["max_age", "max_size"])))]
+    Prune {
+        /// Remove target caches unused for more than this many days.
+        #[arg(long, value_name = "DAYS")]
+        max_age: Option<u64>,
+        /// Limit combined isolated target caches, evicting oldest first (e.g. 20GiB).
+        #[arg(long, value_name = "SIZE", value_parser = cache::parse_size)]
+        max_size: Option<u64>,
+        /// Show the deletion plan without deleting anything.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -1976,6 +2012,41 @@ fn main() -> ExitCode {
 
 fn run() -> Result<(), String> {
     let cli = Cli::parse_from(normalized_args());
+    // Keep the guard alive through all child processes, including the runner.
+    // LSMs have their own Cargo output and do not use the project .scarlet tree.
+    let project = match &cli.command {
+        Commands::Build {
+            project,
+            module: None,
+            ..
+        } => project.as_deref(),
+        Commands::Check { project, .. }
+        | Commands::Clippy { project, .. }
+        | Commands::Run { project, .. }
+        | Commands::Image { project, .. }
+        | Commands::Update { project }
+        | Commands::Cache { project, .. }
+        | Commands::Clean { project, .. } => Some(project.as_path()),
+        _ => None,
+    };
+    let _project_lock = project
+        .map(|path| {
+            let project = normalize_project_path(path)?;
+            cache::validate_project(&project)?;
+            if matches!(
+                &cli.command,
+                Commands::Clean { .. }
+                    | Commands::Cache {
+                        command: CacheCommands::Prune { .. },
+                        ..
+                    }
+            ) {
+                cache::ProjectLock::maintenance(&project)
+            } else {
+                cache::ProjectLock::activity(&project)
+            }
+        })
+        .transpose()?;
     match cli.command {
         Commands::Check {
             project,
@@ -2117,6 +2188,21 @@ fn run() -> Result<(), String> {
         Commands::Update { project } => {
             let project = normalize_project_path(&project)?;
             cmd_update(&project)
+        }
+        Commands::Cache { project, command } => {
+            let project = normalize_project_path(&project)?;
+            match command {
+                CacheCommands::List => cache::list(&project),
+                CacheCommands::Prune {
+                    max_age,
+                    max_size,
+                    dry_run,
+                } => cache::prune(&project, max_age, max_size, dry_run),
+            }
+        }
+        Commands::Clean { project, dry_run } => {
+            let project = normalize_project_path(&project)?;
+            cache::clean(&project, dry_run)
         }
     }
 }
@@ -4177,10 +4263,10 @@ fn install_package(
                     cmd.arg("--features").arg(pkg.features.join(","));
                 }
 
-                let status = cmd
-                    .current_dir(&source)
-                    .status()
-                    .map_err(|e| format!("failed to run cargo build: {e}"))?;
+                cache::record_use(&target_dir, &source);
+                let status = cmd.current_dir(&source).status();
+                cache::record_use(&target_dir, &source);
+                let status = status.map_err(|e| format!("failed to run cargo build: {e}"))?;
 
                 if !status.success() {
                     return Err(format!(
@@ -5308,6 +5394,9 @@ fn scaffold_project(
     let cargo_dir = project_dir.join(".cargo");
     let scarlet_modules_dir = project_dir.join(".scarlet/scarlet-modules/src");
 
+    fs::create_dir_all(&project_dir)
+        .map_err(|e| format!("failed to create {}: {e}", project_dir.display()))?;
+    let _project_lock = cache::ProjectLock::activity(&project_dir)?;
     fs::create_dir_all(&src_dir)
         .map_err(|e| format!("failed to create {}: {e}", src_dir.display()))?;
     fs::create_dir_all(&lds_dir)
@@ -5421,7 +5510,10 @@ pub fn force_link() {}
         modules_lib_rs,
     )?;
 
-    let _ = write_if_changed(&project_dir.join(".gitignore"), ".scarlet\ntarget\n");
+    let _ = write_if_changed(
+        &project_dir.join(".gitignore"),
+        ".scarlet\n.scarlet-operation.lock\ntarget\n",
+    );
 
     let modules_cargo_dir = project_dir.join(".scarlet/scarlet-modules/.cargo");
     fs::create_dir_all(&modules_cargo_dir)

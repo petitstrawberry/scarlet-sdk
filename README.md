@@ -140,6 +140,56 @@ to = "/system/bin/scarlet-ld"
 
 Child Cargo commands do not use the invoking user's `~/.cargo` cache.
 
+Inspect and maintain these artifacts from the project directory, or select one
+with `--project <path>`:
+
+```bash
+cargo scarlet cache list
+cargo scarlet cache prune --max-age 30 --max-size 20GiB --dry-run
+cargo scarlet cache prune --max-age 30 --max-size 20GiB
+cargo scarlet clean --dry-run
+cargo scarlet clean
+```
+
+`cache list` shows `.scarlet` entries by descending disk usage, with their
+purpose, pruning eligibility, and last use. Package target caches record their
+source directory and use time when Cargo runs. Older caches and other artifacts
+use their newest recursive modification time as an estimate. Reading the list
+does not refresh use times. On Unix, sizes count allocated blocks, not sparse
+files' apparent lengths; hard links and filesystem sharing can affect the
+space actually freed.
+
+`cache prune` deletes only the isolated package-root directories under
+`.scarlet/cache/target`. It requires `--max-age <days>` and/or `--max-size <size>`.
+It removes targets older than the age limit, then evicts the least recently used
+targets until their combined size fits the size limit. With both options, recent
+targets can also be evicted to meet the size limit. Sizes accept integer bytes,
+binary units such as `GiB`, and decimal units such as `GB`; `--max-size 0` removes
+all eligible targets. This is explicit maintenance, not automatic eviction.
+Source checkouts, downloaded inputs, Cargo's registry cache, images, and
+unrecognized target entries are retained and excluded from the size limit.
+Package-root isolation is preserved when deleted targets are rebuilt.
+
+`clean` removes **all of `.scarlet`**, including caches, generated module
+configuration, images, and any guest-created data in those images. It works even
+when the manifest is invalid, provided `scarlet.toml` exists. Keep configuration
+that needs to survive cleaning outside `.scarlet`, for example in the
+`[userspace].cargo-config` file described below. Project sources, `scarlet.lock`,
+and Cargo outputs outside `.scarlet` (such as `bsp/target`) are retained.
+
+Both deletion commands support `--dry-run`, reject Git-tracked files in the
+enclosing working tree, and never follow symlinks during traversal. A symlink
+at `.scarlet` itself is rejected. SDK project commands hold shared locks in the
+persistent `.scarlet-operation.lock` file beside `scarlet.toml`; deletion takes
+an exclusive lock and fails while another SDK command is active, including a
+foreground runner. Builds may still run concurrently with other builds.
+The lock stays after cleaning so another process cannot bypass it. New project
+scaffolds ignore this file; add `.scarlet-operation.lock` to existing projects'
+`.gitignore`. Listing and dry runs can create this coordination file but do not
+change `.scarlet`. Older SDK versions, directly invoked Cargo, detached runners,
+and other external tools do not participate in this lock; finish those processes
+before maintenance.
+
 ### Network access
 
 `cargo-scarlet` does not offer an `--offline` mode. The former option only
@@ -256,6 +306,9 @@ cargo scarlet run --project <path> --release      # Build images and launch runn
 cargo scarlet update --project <path>             # Resolve git/URL sources, write lock
 cargo scarlet new --project <name> --target <triple>  # Scaffold new project
 cargo scarlet new --lsm <name>                       # Scaffold new loadable scarlet module
+cargo scarlet cache list --project <path>         # Inspect project artifacts by size
+cargo scarlet cache prune --max-size 20GiB        # Bound isolated targets in this project
+cargo scarlet clean                              # Remove this project's entire .scarlet
 ```
 
 ## Documentation
