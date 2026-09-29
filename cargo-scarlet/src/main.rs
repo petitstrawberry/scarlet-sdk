@@ -284,6 +284,13 @@ struct BspConfig<'a> {
 struct ManifestImageSection {
     format: Option<String>,
     output: Option<String>,
+    /// Minimum ext2 filesystem size; the content-based estimate can exceed it.
+    #[serde(
+        default,
+        rename = "min-size-mib",
+        skip_serializing_if = "Option::is_none"
+    )]
+    min_size_mib: Option<u64>,
     #[serde(default)]
     cmdline: String,
     #[serde(default)]
@@ -956,6 +963,18 @@ fn load_manifest(project_dir: &Path) -> Result<ScarletManifest, String> {
             "unsupported schema_version {} (expected 2)",
             manifest.schema_version
         ));
+    }
+
+    for (name, image) in &manifest.images {
+        if let Some(min_size_mib) = image.min_size_mib {
+            if !matches!(image.format.as_deref(), Some("ext2" | "gpt-ext2")) {
+                return Err(format!(
+                    "images.{name}: min-size-mib requires ext2 or gpt-ext2"
+                ));
+            }
+            ext2_size_kib(0, Some(min_size_mib))
+                .map_err(|error| format!("images.{name}: {error}"))?;
+        }
     }
 
     Ok(manifest)
@@ -2466,7 +2485,8 @@ fn build_manifest_image(
                 }
 
                 let staging_hash = sha256_dir(&staging_dir)?;
-                let image_hash = image_content_hash(format, &staging_hash);
+                let image_hash =
+                    image_content_hash(format, &staging_hash, section_cfg.min_size_mib);
 
                 let existing_section_lock = existing_lock.sections.get(&section_name);
                 if image_output_is_current(
@@ -2500,10 +2520,20 @@ fn build_manifest_image(
                         );
                     }
                     "ext2" => {
-                        build_ext2_from_staging(&staging_dir, &output_path, &section_name)?;
+                        build_ext2_from_staging(
+                            &staging_dir,
+                            &output_path,
+                            &section_name,
+                            section_cfg.min_size_mib,
+                        )?;
                     }
                     "gpt-ext2" => {
-                        build_gpt_ext2_from_staging(&staging_dir, &output_path, &section_name)?;
+                        build_gpt_ext2_from_staging(
+                            &staging_dir,
+                            &output_path,
+                            &section_name,
+                            section_cfg.min_size_mib,
+                        )?;
                     }
                     _ => unreachable!(),
                 }
@@ -2784,10 +2814,14 @@ fn topo_sort_images(
     Ok(result)
 }
 
-fn image_content_hash(format: &str, staging_hash: &str) -> String {
+fn image_content_hash(format: &str, staging_hash: &str, min_size_mib: Option<u64>) -> String {
     let mut hasher = Sha256::new();
     hasher.update(format!("format={format}\n").as_bytes());
     hasher.update(format!("staging={staging_hash}\n").as_bytes());
+    // Keep existing image hashes unchanged when no minimum was requested.
+    if let Some(size) = min_size_mib {
+        hasher.update(format!("min-size-mib={size}\n").as_bytes());
+    }
     format!("sha256:{}", hex::encode(hasher.finalize()))
 }
 
@@ -3114,6 +3148,7 @@ fn build_gpt_ext2_from_staging(
     staging_dir: &Path,
     output_path: &Path,
     section_name: &str,
+    min_size_mib: Option<u64>,
 ) -> Result<(), String> {
     let output_parent = output_path
         .parent()
@@ -3136,7 +3171,7 @@ fn build_gpt_ext2_from_staging(
 
     let result = (|| {
         let partition_image = work_dir.join("rootfs.ext2");
-        build_ext2_from_staging(staging_dir, &partition_image, section_name)?;
+        build_ext2_from_staging(staging_dir, &partition_image, section_name, min_size_mib)?;
 
         let partition_size = file_size(&partition_image)?;
         let partition_lbas = partition_size.div_ceil(GPT_SECTOR_SIZE);
@@ -3223,10 +3258,31 @@ const GPT_SECTOR_SIZE: u64 = 512;
 const GPT_FIRST_PARTITION_LBA: u64 = 2048;
 const GPT_TRAILING_PADDING_LBAS: u64 = 2048;
 
+fn ext2_size_kib(source_kib: u64, min_size_mib: Option<u64>) -> Result<u64, String> {
+    if min_size_mib == Some(0) {
+        return Err("min-size-mib must be greater than zero".to_string());
+    }
+    let minimum_kib = min_size_mib
+        .unwrap_or(0)
+        .checked_mul(1024)
+        .ok_or("ext2 size overflow")?;
+    let estimated_kib = source_kib
+        .checked_add(source_kib / 3)
+        .and_then(|size| size.checked_add(65536))
+        .ok_or("ext2 size overflow")?;
+    let size_kib = align_up(estimated_kib.max(minimum_kib), 16384)?;
+    // Host file offsets are signed, even though the manifest size is unsigned.
+    if size_kib > i64::MAX as u64 / 1024 {
+        return Err("ext2 size exceeds the host file size limit".to_string());
+    }
+    Ok(size_kib)
+}
+
 fn build_ext2_from_staging(
     staging_dir: &Path,
     output_path: &Path,
     section_name: &str,
+    min_size_mib: Option<u64>,
 ) -> Result<(), String> {
     let source_kb_output = Command::new("du")
         .args(["-sk", staging_dir.to_str().unwrap_or("")])
@@ -3239,8 +3295,7 @@ fn build_ext2_from_staging(
         .unwrap_or("0")
         .parse()
         .unwrap_or(0);
-    let extra_kb: u64 = 65536;
-    let size_kb = (source_kb + source_kb / 3 + extra_kb).div_ceil(16384) * 16384;
+    let size_kb = ext2_size_kib(source_kb, min_size_mib)?;
 
     if let Some(parent) = output_path.parent() {
         fs::create_dir_all(parent)
@@ -6301,6 +6356,45 @@ to = "/system/scarlet/bin/video_player"
     }
 
     #[test]
+    fn ext2_minimum_size_preserves_auto_growth_and_rejects_overflow() {
+        assert_eq!(ext2_size_kib(0, None).unwrap(), 65536);
+        assert_eq!(
+            ext2_size_kib(2 * 1024 * 1024, Some(8192)).unwrap(),
+            8 * 1024 * 1024
+        );
+        // A minimum must never truncate an image whose contents need more space.
+        assert_eq!(
+            ext2_size_kib(9 * 1024 * 1024, Some(8192)).unwrap(),
+            ext2_size_kib(9 * 1024 * 1024, None).unwrap()
+        );
+        assert_eq!(ext2_size_kib(0, Some(65)).unwrap(), 80 * 1024);
+        assert!(ext2_size_kib(0, Some(0)).is_err());
+        assert!(ext2_size_kib(0, Some(u64::MAX)).is_err());
+        assert!(ext2_size_kib(u64::MAX, None).is_err());
+        assert!(ext2_size_kib(0, Some(i64::MAX as u64 / (1024 * 1024))).is_err());
+    }
+
+    #[test]
+    fn image_minimum_size_invalidates_cache_without_changing_legacy_hashes() {
+        let mut legacy = Sha256::new();
+        legacy.update(b"format=ext2\nstaging=unchanged\n");
+        assert_eq!(
+            image_content_hash("ext2", "unchanged", None),
+            format!("sha256:{}", hex::encode(legacy.finalize()))
+        );
+        for format in ["ext2", "gpt-ext2"] {
+            assert_ne!(
+                image_content_hash(format, "unchanged", None),
+                image_content_hash(format, "unchanged", Some(8192))
+            );
+            assert_ne!(
+                image_content_hash(format, "unchanged", Some(4096)),
+                image_content_hash(format, "unchanged", Some(8192))
+            );
+        }
+    }
+
+    #[test]
     fn gpt_ext2_image_contains_root_partition() {
         if !command_exists("mke2fs") {
             eprintln!("skipping gpt-ext2 image test: mke2fs not found");
@@ -6317,13 +6411,17 @@ to = "/system/scarlet/bin/video_player"
         fs::write(staging.join("etc/issue"), "Scarlet\n").unwrap();
         let output = temp.join("rootfs.img");
 
-        build_gpt_ext2_from_staging(&staging, &output, "rootfs").unwrap();
+        build_gpt_ext2_from_staging(&staging, &output, "rootfs", Some(128)).unwrap();
 
         let disk = gpt::GptConfig::new().open(&output).unwrap();
         let partition = disk.partitions().get(&1).expect("missing partition 1");
         assert_eq!(partition.name, "SCARLET_ROOT");
         assert_eq!(partition.first_lba, GPT_FIRST_PARTITION_LBA);
         assert_eq!(partition.part_type_guid, gpt::partition_types::LINUX_FS);
+        assert_eq!(
+            (partition.last_lba - partition.first_lba + 1) * GPT_SECTOR_SIZE,
+            128 * 1024 * 1024
+        );
 
         let image_size = fs::metadata(&output).unwrap().len();
         assert!(image_size > partition.last_lba * GPT_SECTOR_SIZE);

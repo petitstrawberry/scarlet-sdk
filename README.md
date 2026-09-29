@@ -34,6 +34,23 @@ Image generation uses external filesystem and disk-image tools:
 
 Use `format = "ext2"` and `format = "limine-uefi"` to build partition payload images, then `format = "gpt"` to compose those payloads into a GPT disk image. `format = "gpt-ext2"` remains available for simple one-partition root images. GPT partition tables are written through the Rust `gpt` crate.
 
+For writable workloads such as Wine prefixes or package installation, reserve
+additional capacity with `min-size-mib`:
+
+```toml
+[images.rootfs]
+format = "ext2"
+output = ".scarlet/images/rootfs.ext2"
+min-size-mib = 8192
+```
+
+This positive integer sets a minimum filesystem size in MiB for `ext2` and
+`gpt-ext2`. The content-based estimate still applies if it is larger; the result
+is rounded up to a multiple of 16 MiB. Omitting the field preserves automatic
+sizing. Changing it invalidates the image cache and regenerates the filesystem
+from its layers, followed by any GPT image containing it. This does not resize
+an existing guest filesystem in place or retain guest-created files.
+
 ### Limine boot files
 
 `limine-uefi` supports an optional full `dtb` path for platforms that must replace the firmware device tree. Local `copy` layers on the boot image are also copied into the FAT image at their absolute `to` path:
