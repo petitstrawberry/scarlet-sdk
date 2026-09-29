@@ -51,6 +51,22 @@ sizing. Changing it invalidates the image cache and regenerates the filesystem
 from its layers, followed by any GPT image containing it. This does not resize
 an existing guest filesystem in place or retain guest-created files.
 
+To create an exact capacity instead, replace `min-size-mib` with `size-mib`:
+
+```toml
+[images.rootfs]
+format = "ext2"
+output = ".scarlet/images/rootfs.ext2"
+size-mib = 8192
+```
+
+`size-mib` must be a positive integer. It does not round up to 16 MiB or grow
+to fit the contents. If `mke2fs` cannot fit the filesystem and its files, image
+generation fails. `size-mib` and `min-size-mib` cannot be combined. Both work
+with `gpt-ext2` as well, where they specify the ext2 partition capacity, excluding
+the surrounding GPT metadata and alignment padding. Changing either setting
+regenerates the image.
+
 ### Limine boot files
 
 `limine-uefi` supports an optional full `dtb` path for platforms that must replace the firmware device tree. Local `copy` layers on the boot image are also copied into the FAT image at their absolute `to` path:
