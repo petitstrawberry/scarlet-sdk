@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -70,6 +70,9 @@ enum Commands {
     Image {
         #[arg(long)]
         project: PathBuf,
+        /// Build only this image and its dependencies (can be repeated).
+        #[arg(long = "image", value_name = "NAME")]
+        images: Vec<String>,
         #[arg(long)]
         target: Option<String>,
         #[arg(long)]
@@ -439,9 +442,9 @@ struct SectionLock {
     hash: String,
     #[serde(default)]
     layers: Vec<LayerLock>,
-    #[serde(default, skip_serializing)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     files: Vec<FileLock>,
-    #[serde(default, skip_serializing)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     packages: Vec<PackageLock>,
 }
 
@@ -1582,7 +1585,49 @@ fn resolve_layers_into(
 }
 
 fn expand_manifest(project_dir: &Path) -> Result<ExpandedManifest, String> {
-    let manifest = load_manifest(project_dir)?;
+    expand_manifest_for_images(project_dir, &[])
+}
+
+fn select_manifest_images(
+    images: &mut BTreeMap<String, ManifestImageSection>,
+    selected: &[String],
+) -> Result<(), String> {
+    if selected.is_empty() {
+        return Ok(());
+    }
+
+    let mut included = BTreeSet::new();
+    let mut pending = selected.to_vec();
+    while let Some(name) = pending.pop() {
+        if !included.insert(name.clone()) {
+            continue;
+        }
+        let section = images
+            .get(&name)
+            .ok_or_else(|| format!("unknown image '{name}'"))?;
+        for dependency in &section.deps {
+            if !images.contains_key(dependency) {
+                return Err(format!(
+                    "image '{name}' depends on unknown image '{dependency}'"
+                ));
+            }
+            pending.push(dependency.clone());
+        }
+    }
+
+    images.retain(|name, _| included.contains(name));
+    topo_sort_images(images)?;
+    Ok(())
+}
+
+fn expand_manifest_for_images(
+    project_dir: &Path,
+    selected: &[String],
+) -> Result<ExpandedManifest, String> {
+    let mut manifest = load_manifest(project_dir)?;
+    // Select before expanding bundles: unrelated images may refer to optional
+    // external projects that are not available for this build.
+    select_manifest_images(&mut manifest.images, selected)?;
     let bsp = manifest_bsp_config(&manifest, project_dir)?;
     let target_triple = target_triple_from_build_target(&bsp.build_target)?;
     let raw_arch = target_triple.split('-').next().unwrap_or("unknown");
@@ -1616,7 +1661,14 @@ fn expand_manifest(project_dir: &Path) -> Result<ExpandedManifest, String> {
 }
 
 fn generate_from_manifest(project_dir: &Path) -> Result<ExpandedManifest, String> {
-    let expanded = expand_manifest(project_dir)?;
+    generate_from_manifest_for_images(project_dir, &[])
+}
+
+fn generate_from_manifest_for_images(
+    project_dir: &Path,
+    selected: &[String],
+) -> Result<ExpandedManifest, String> {
+    let expanded = expand_manifest_for_images(project_dir, selected)?;
 
     let generated_root = project_dir.join(".scarlet/scarlet-modules");
     let generated_src = generated_root.join("src");
@@ -2028,7 +2080,7 @@ fn run() -> Result<(), String> {
             }
 
             if !no_image {
-                build_manifest_image(&project, target, release, None, false, locked)?;
+                build_manifest_image(&project, target, release, None, false, locked, &[])?;
             }
 
             match &expanded.manifest.runner {
@@ -2063,6 +2115,7 @@ fn run() -> Result<(), String> {
         }
         Commands::Image {
             project,
+            images,
             target,
             release,
             kernel_elf,
@@ -2070,7 +2123,9 @@ fn run() -> Result<(), String> {
             locked,
         } => {
             let project = normalize_project_path(&project)?;
-            build_manifest_image(&project, target, release, kernel_elf, no_build, locked)
+            build_manifest_image(
+                &project, target, release, kernel_elf, no_build, locked, &images,
+            )
         }
         Commands::New {
             module,
@@ -2305,8 +2360,9 @@ fn build_manifest_image(
     kernel_elf: Option<PathBuf>,
     no_build: bool,
     locked: bool,
+    selected: &[String],
 ) -> Result<(), String> {
-    let mut expanded = generate_from_manifest(project)?;
+    let mut expanded = generate_from_manifest_for_images(project, selected)?;
     let existing_lock = load_lock(project);
     if locked {
         validate_locked_archive_layers(&expanded, &existing_lock)?;
@@ -2370,7 +2426,11 @@ fn build_manifest_image(
     let build_order = topo_sort_images(&expanded.manifest.images)?;
 
     resolve_git_sources(&mut expanded, project, &existing_lock)?;
-    let mut new_lock = ImageLock::default();
+    let mut new_lock = if selected.is_empty() {
+        ImageLock::default()
+    } else {
+        existing_lock.clone()
+    };
 
     for section_name in build_order {
         let section_cfg = expanded
@@ -5478,6 +5538,166 @@ to = "/"
             assert_eq!(userspace_target_triple(target), userspace);
             fs::remove_dir_all(project).unwrap();
         }
+    }
+
+    #[test]
+    fn cli_image_accepts_repeated_image_selection() {
+        let cli = Cli::try_parse_from([
+            "cargo-scarlet",
+            "image",
+            "--project",
+            "project",
+            "--image",
+            "initramfs",
+            "--image",
+            "boot",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Image { images, .. } => assert_eq!(images, ["initramfs", "boot"]),
+            _ => panic!("expected image command"),
+        }
+    }
+
+    #[test]
+    fn image_selection_rejects_unknown_names_dependencies_and_cycles() {
+        let mut images = BTreeMap::from([
+            ("base".to_string(), ManifestImageSection::default()),
+            (
+                "initramfs".to_string(),
+                ManifestImageSection {
+                    deps: vec!["base".to_string()],
+                    ..Default::default()
+                },
+            ),
+        ]);
+        assert_eq!(
+            select_manifest_images(&mut images, &["typo".to_string()]).unwrap_err(),
+            "unknown image 'typo'"
+        );
+        images.get_mut("base").unwrap().deps = vec!["missing".to_string()];
+        assert_eq!(
+            select_manifest_images(&mut images, &["initramfs".to_string()]).unwrap_err(),
+            "image 'base' depends on unknown image 'missing'"
+        );
+        images.get_mut("base").unwrap().deps = vec!["initramfs".to_string()];
+        assert_eq!(
+            select_manifest_images(&mut images, &["initramfs".to_string()]).unwrap_err(),
+            "circular dependency detected in images"
+        );
+    }
+
+    #[test]
+    fn selected_images_build_dependencies_without_unrelated_bundles_and_keep_lock() {
+        let project = std::env::temp_dir().join(format!(
+            "cargo-scarlet-selected-images-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(project.join("bsp/.cargo")).unwrap();
+        fs::write(
+            project.join("bsp/.cargo/config.toml"),
+            "[build]\ntarget = \"aarch64-unknown-none\"\n",
+        )
+        .unwrap();
+        fs::write(project.join("payload"), "selected payload").unwrap();
+        fs::write(
+            project.join("scarlet.toml"),
+            r#"
+schema_version = 2
+[project]
+name = "selected-images"
+[bsp]
+path = "bsp"
+package = "scarlet"
+[bsp.kernel]
+source = { path = "kernel" }
+[images.base]
+format = "newc"
+output = ".scarlet/images/base.cpio"
+[[images.base.layers]]
+kind = "copy"
+source = "payload"
+to = "/payload"
+[images.initramfs]
+format = "newc"
+output = ".scarlet/images/initramfs.cpio"
+deps = ["base"]
+[[images.initramfs.layers]]
+kind = "image"
+source = "base"
+to = "/"
+[images.rescue]
+format = "newc"
+output = ".scarlet/images/rescue.cpio"
+[images.rootfs]
+format = "ext2"
+output = ".scarlet/images/rootfs.ext2"
+[[images.rootfs.layers]]
+kind = "bundle"
+path = "missing-external-project/bundle.toml"
+"#,
+        )
+        .unwrap();
+        let rootfs_lock = SectionLock {
+            hash: "existing-rootfs-hash".to_string(),
+            layers: vec![LayerLock::Copy {
+                source: "rootfs-config".to_string(),
+                to: "/etc/config".to_string(),
+                template: false,
+                hash: "config-hash".to_string(),
+            }],
+            files: vec![FileLock {
+                source: "legacy-asset".to_string(),
+                to: "/asset".to_string(),
+                template: false,
+                hash: "legacy-file-hash".to_string(),
+            }],
+            packages: vec![
+                toml::from_str("kind = \"cargo\"\nhash = \"legacy-package-hash\"\n").unwrap(),
+            ],
+        };
+        let old_rootfs_lock = toml::to_string(&rootfs_lock).unwrap();
+        save_lock(
+            &project,
+            &ImageLock {
+                sections: BTreeMap::from([("rootfs".to_string(), rootfs_lock)]),
+            },
+        )
+        .unwrap();
+
+        build_manifest_image(
+            &project,
+            None,
+            false,
+            Some(project.join("unused-kernel")),
+            true,
+            false,
+            &["initramfs".to_string(), "rescue".to_string()],
+        )
+        .unwrap();
+
+        for image in ["base", "initramfs", "rescue"] {
+            assert!(
+                project
+                    .join(format!(".scarlet/images/{image}.cpio"))
+                    .is_file()
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(project.join(".scarlet/staging/initramfs/payload")).unwrap(),
+            "selected payload"
+        );
+        assert!(!project.join(".scarlet/images/rootfs.ext2").exists());
+        assert!(!project.join(".scarlet/staging/rootfs").exists());
+        let lock = load_lock(&project);
+        assert_eq!(lock.sections.len(), 4);
+        assert_eq!(
+            toml::to_string(&lock.sections["rootfs"]).unwrap(),
+            old_rootfs_lock
+        );
+        // An ordinary build still expands every image and reports the missing bundle.
+        assert!(expand_manifest(&project).is_err());
+        fs::remove_dir_all(project).unwrap();
     }
 
     #[test]
