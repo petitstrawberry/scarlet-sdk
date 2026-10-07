@@ -1,3 +1,4 @@
+mod app;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::fs;
@@ -20,6 +21,10 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
+    App {
+        #[command(subcommand)]
+        command: app::AppCommands,
+    },
     Build {
         #[arg(long)]
         project: Option<PathBuf>,
@@ -324,6 +329,10 @@ struct ManifestGptPartition {
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 enum ManifestLayer {
+    App {
+        source: String,
+        to: String,
+    },
     Bundle {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         path: Option<String>,
@@ -502,6 +511,11 @@ struct PackageLock {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 enum LayerLock {
+    App {
+        source: String,
+        to: String,
+        hash: String,
+    },
     Copy {
         source: String,
         #[serde(default)]
@@ -640,7 +654,7 @@ impl SectionLock {
                     output: output.clone(),
                     hash: hash.clone(),
                 }),
-                LayerLock::Copy { .. } | LayerLock::Archive { .. } => None,
+                LayerLock::Copy { .. } | LayerLock::Archive { .. } | LayerLock::App { .. } => None,
             }))
     }
 
@@ -792,6 +806,22 @@ fn validate_locked_archive_layers(
 ) -> Result<(), String> {
     for (section_name, section) in &expanded.sections {
         let section_lock = existing_lock.sections.get(section_name);
+        for layer in &section.layers {
+            if let ResolvedLayer::App { source, to } = layer {
+                let relative_source = pathdiff(source, &expanded.project_dir)?
+                    .to_string_lossy()
+                    .to_string();
+                let matches = section_lock.is_some_and(|section| section.layers.iter().any(|lock| {
+                    matches!(lock, LayerLock::App { source: locked_source, to: locked_to, .. } if locked_source == &relative_source && locked_to == to)
+                }));
+                if !matches {
+                    return Err(format!(
+                        "--locked: app layer {} in section {section_name} differs or is missing from scarlet.lock; run `cargo scarlet update`",
+                        source.display()
+                    ));
+                }
+            }
+        }
         for archive in section.layers.iter().filter_map(|layer| match layer {
             ResolvedLayer::Archive(archive) => Some(archive),
             _ => None,
@@ -919,6 +949,7 @@ struct PackageLayerSpec {
 
 #[allow(clippy::large_enum_variant)]
 enum ResolvedLayer {
+    App { source: PathBuf, to: String },
     Copy(ResolvedFile),
     Archive(ResolvedArchive),
     Package(ResolvedPackage),
@@ -1196,6 +1227,10 @@ fn project_cargo_command(project: &Path) -> Command {
 }
 
 fn userspace_cargo_config(project: &Path) -> Result<Option<PathBuf>, String> {
+    // Standalone app recipes have no project manifest; use their Cargo config.
+    if !project.join("scarlet.toml").is_file() {
+        return Ok(None);
+    }
     let manifest = load_manifest(project)?;
     let Some(path) = manifest.userspace.cargo_config else {
         return Ok(None);
@@ -1468,6 +1503,19 @@ fn resolve_layers_into(
 ) -> Result<(), String> {
     for layer in layers {
         match layer {
+            ManifestLayer::App { source, to } => {
+                let to = ctx.expand(to);
+                let name = to
+                    .strip_prefix("/applications/")
+                    .ok_or("app layers must stage under /applications")?;
+                if name.contains('/') || !name.ends_with(".app") {
+                    return Err("app layer destination must be /applications/<slug>.app".into());
+                }
+                resolved.push(ResolvedLayer::App {
+                    source: resolve_path(base_dir, &ctx.expand(source)),
+                    to,
+                });
+            }
             ManifestLayer::Bundle {
                 path,
                 source,
@@ -2002,6 +2050,13 @@ fn cmd_update(project: &Path) -> Result<(), String> {
                         previous_hash,
                     )?));
                 }
+                ResolvedLayer::App { source, to } => {
+                    layers.push(LayerLock::App {
+                        source: pathdiff(source, project)?.to_string_lossy().to_string(),
+                        to: to.clone(),
+                        hash: String::new(),
+                    });
+                }
                 ResolvedLayer::Image { .. } => {}
             }
         }
@@ -2029,6 +2084,7 @@ fn main() -> ExitCode {
 fn run() -> Result<(), String> {
     let cli = Cli::parse_from(normalized_args());
     match cli.command {
+        Commands::App { command } => app::run(command),
         Commands::Check {
             project,
             target,
@@ -2532,6 +2588,22 @@ fn build_manifest_image(
                             )? {
                                 layer_locks.push(package_lock_to_layer(lock));
                             }
+                        }
+                        ResolvedLayer::App { source, to } => {
+                            let destination = staging_dir.join(to.trim_start_matches('/'));
+                            ensure_no_symlink_ancestors(&staging_dir, &destination)?;
+                            app::build(
+                                source,
+                                &destination,
+                                &userspace_target_triple(&target_triple),
+                                release,
+                                project,
+                            )?;
+                            layer_locks.push(LayerLock::App {
+                                source: pathdiff(source, project)?.to_string_lossy().to_string(),
+                                to: to.clone(),
+                                hash: sha256_dir(&destination)?,
+                            });
                         }
                         ResolvedLayer::Image { source, to } => {
                             let from_staging = project.join(format!(".scarlet/staging/{}", source));
@@ -4117,7 +4189,7 @@ fn plugin_packages_from_layers(
                     to: to.clone(),
                 });
             }
-            ResolvedLayer::Archive(_) | ResolvedLayer::Package(_) => {}
+            ResolvedLayer::Archive(_) | ResolvedLayer::Package(_) | ResolvedLayer::App { .. } => {}
         }
     }
     Ok(packages)
@@ -4213,7 +4285,11 @@ fn install_package(
                     "cargo-scarlet: building {} ({}) for {}...",
                     package_name, bin_name, userspace_triple
                 );
-                let mut cmd = project_cargo_command(project);
+                let mut cmd = if project.join("scarlet.toml").is_file() {
+                    project_cargo_command(project)
+                } else {
+                    Command::new("cargo")
+                };
                 if let Some(config) = userspace_cargo_config(project)? {
                     cmd.arg("--config").arg(config);
                 }
@@ -4227,6 +4303,9 @@ fn install_package(
                     .arg(&userspace_triple);
                 cmd.env("CARGO_TARGET_DIR", &target_dir);
 
+                if let Some(package) = pkg.package_name.as_deref() {
+                    cmd.arg("--package").arg(package);
+                }
                 if let Some(bin) = pkg.bin.as_deref() {
                     cmd.arg("--bin").arg(bin);
                 }
