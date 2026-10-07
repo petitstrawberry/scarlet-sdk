@@ -6346,7 +6346,7 @@ source = "user/scarlet-ld"
 package = "scarlet-ld"
 bin = "scarlet-ld"
 architectures = ["aarch64", "riscv64"]
-to = "/system/bin/scarlet-ld"
+to = "/bin/scarlet-ld"
 "#;
         let bundle: BundleManifest = toml::from_str(toml_str).unwrap();
         let images = BTreeMap::new();
