@@ -518,6 +518,22 @@ pub fn build(
     project: &Path,
 ) -> Result<(), String> {
     native_machine(target)?;
+    let source = source.canonicalize().map_err(|e| e.to_string())?;
+    // App builds can share project Cargo caches and stage inside .scarlet.
+    // Retain the guard through child execution and final output publication.
+    // Standalone recipes use their source directory as the Cargo cache root.
+    let cache_project = if project.join("scarlet.toml").is_file() {
+        project
+    } else if source.is_dir() {
+        source.as_path()
+    } else {
+        source.parent().ok_or("missing recipe directory")?
+    };
+    let _project_lock = if cache_project.join("scarlet.toml").is_file() {
+        Some(cache::ProjectLock::activity(cache_project)?)
+    } else {
+        None
+    };
     let absolute = if output.is_absolute() {
         output.to_path_buf()
     } else {
@@ -541,7 +557,7 @@ pub fn build(
     ));
     fs::create_dir(&temporary).map_err(|e| e.to_string())?;
     let staged = temporary.join(name);
-    let result = build_inner(source, &staged, target, release, project).and_then(|()| {
+    let result = build_inner(&source, &staged, target, release, project).and_then(|()| {
         if fs::symlink_metadata(&destination).is_ok() {
             return Err("app output appeared during build".into());
         }
