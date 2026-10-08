@@ -185,3 +185,101 @@ command = "runner.sh"
     success(project.run(&["clean"]));
     assert!(!image.exists());
 }
+
+#[cfg(unix)]
+#[test]
+fn app_build_locks_project_and_standalone_recipe_cache_roots() {
+    use std::io::{BufRead, BufReader};
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Stdio;
+
+    for standalone in [false, true] {
+        let project = Project::new();
+        let source = project.0.join("source");
+        fs::create_dir(&source).unwrap();
+        let cache_project = if standalone {
+            fs::remove_file(project.0.join("scarlet.toml")).unwrap();
+            fs::write(source.join("scarlet.toml"), "invalid TOML [").unwrap();
+            &source
+        } else {
+            &project.0
+        };
+        let image = cache_project.join(".scarlet/images/keep.img");
+        fs::create_dir_all(image.parent().unwrap()).unwrap();
+        fs::write(&image, "guest data").unwrap();
+        fs::write(
+            source.join("app.toml"),
+            r#"
+[app]
+id = "org.test.player"
+slug = "player"
+name = "Player"
+exec = "bin/player"
+[build]
+kind = "script"
+source = "wait.sh"
+"#,
+        )
+        .unwrap();
+        let mut elf = [0u8; 64];
+        elf[..8].copy_from_slice(b"\x7fELF\x02\x01\x01\x53");
+        elf[16..18].copy_from_slice(&2u16.to_le_bytes());
+        elf[18..20].copy_from_slice(&183u16.to_le_bytes());
+        fs::write(source.join("player"), elf).unwrap();
+        let script = source.join("wait.sh");
+        let shell = success(
+            Command::new("sh")
+                .args(["-c", "command -v sh"])
+                .output()
+                .unwrap(),
+        );
+        fs::write(
+            &script,
+            format!(
+                "#!{}\necho APP_BUILD_READY\nread ignored\ncp player \"$2\"\nchmod +x \"$2\"\n",
+                shell.trim()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(script, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut builder = project
+            .command()
+            .args([
+                "app",
+                "build",
+                "--source",
+                "source",
+                "--target",
+                "aarch64-unknown-scarlet",
+                "--output",
+                "player.app",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdout = BufReader::new(builder.stdout.take().unwrap());
+        let mut line = String::new();
+        assert_ne!(
+            stdout.read_line(&mut line).unwrap(),
+            0,
+            "app builder exited early"
+        );
+        assert!(line.contains("APP_BUILD_READY"));
+        let protected = cache_project.to_str().unwrap();
+        let results = [
+            project.run(&["clean", "--project", protected]),
+            project.run(&["cache", "prune", "--project", protected, "--max-size", "0"]),
+        ];
+        success(project.run(&["cache", "list", "--project", protected]));
+        drop(builder.stdin.take());
+        assert!(builder.wait().unwrap().success());
+        for output in results {
+            assert!(!output.status.success());
+            assert!(String::from_utf8_lossy(&output.stderr).contains("in use"));
+        }
+        assert!(image.exists());
+        success(project.run(&["clean", "--project", protected]));
+        assert!(!image.exists());
+    }
+}

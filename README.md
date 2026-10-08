@@ -110,7 +110,7 @@ source = { git = "https://github.com/petitstrawberry/scarlet-ui" }
 subdir = "examples/widget-factory"
 package = "scarlet-ui-widget-factory"
 bin = "scarlet-ui-widget-factory"
-to = "/system/scarlet/bin/widget_factory"
+to = "/bin/widget-factory"
 ```
 
 Set `architectures` when a Cargo layer is only available for selected target
@@ -123,7 +123,7 @@ source = "../../user/scarlet-ld"
 package = "scarlet-ld"
 bin = "scarlet-ld"
 architectures = ["aarch64", "riscv64"]
-to = "/system/bin/scarlet-ld"
+to = "/bin/scarlet-ld"
 ```
 
 ### Project-local caches
@@ -320,3 +320,14 @@ See the [Scarlet build-system guide](https://github.com/petitstrawberry/Scarlet/
 for reference-project integration and [userspace development](https://github.com/petitstrawberry/Scarlet/blob/dev/docs/userspace/README.md)
 for the distinction between the SDK, normal Rust std applications, and legacy
 native user libraries.
+
+## Native app directories
+
+`cargo scarlet app build --source <source-or-app.toml-or-prebuilt.app>
+--target aarch64-unknown-scarlet --release --output dist/<slug>.app` produces a
+finished native application. Output must be new. The source `app.toml` generates
+one `<stable-app-id>.desktop`; recipes stay in the source tree. An image layer
+`kind = "app"`, `source = "path/to/app.toml"` (or a prebuilt `.app`) and
+`to = "/applications/<slug>.app"` shares the same validation. `bundle` continues
+to group image layers. See Scarlet's `docs/build-system/applications.md` for
+recipe fields, script/Cargo/prebuilt workflows and explicit stemd reload.
