@@ -399,6 +399,7 @@ enum ManifestLayer {
         subdir: Option<String>,
         package: Option<String>,
         bin: Option<String>,
+        lib: Option<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         features: Vec<String>,
         #[serde(rename = "default-features")]
@@ -530,6 +531,8 @@ struct PackageLock {
     package: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     bin: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    lib: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     subdir: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -582,6 +585,8 @@ enum LayerLock {
         package: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         bin: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lib: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         subdir: Option<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -650,6 +655,7 @@ impl SectionLock {
                     resolved_rev,
                     package,
                     bin,
+                    lib,
                     subdir,
                     features,
                     default_features,
@@ -663,6 +669,7 @@ impl SectionLock {
                     resolved_rev: resolved_rev.clone(),
                     package: package.clone(),
                     bin: bin.clone(),
+                    lib: lib.clone(),
                     subdir: subdir.clone(),
                     features: features.clone(),
                     default_features: *default_features,
@@ -683,6 +690,7 @@ impl SectionLock {
                     resolved_rev: None,
                     package: None,
                     bin: None,
+                    lib: None,
                     subdir: None,
                     features: Vec::new(),
                     default_features: None,
@@ -730,6 +738,7 @@ fn package_lock_to_layer(lock: PackageLock) -> LayerLock {
             resolved_rev: lock.resolved_rev,
             package: lock.package,
             bin: lock.bin,
+            lib: lock.lib,
             subdir: lock.subdir,
             features: lock.features,
             default_features: lock.default_features,
@@ -771,7 +780,7 @@ fn package_lock_matches_input(
     if lock.package != pkg.package_name {
         return Ok(false);
     }
-    if lock.bin != pkg.bin {
+    if lock.bin != pkg.bin || lock.lib != pkg.lib {
         return Ok(false);
     }
     if lock.subdir != pkg.subdir {
@@ -922,6 +931,7 @@ fn package_input_lock(
         resolved_rev: pkg.resolved_rev.clone(),
         package: pkg.package_name.clone(),
         bin: pkg.bin.clone(),
+        lib: pkg.lib.clone(),
         subdir: pkg.subdir.clone(),
         features: pkg.features.clone(),
         default_features: pkg.default_features,
@@ -948,6 +958,7 @@ fn find_package_lock_for_input(
         lock.kind == pkg.kind.as_deref().unwrap_or("")
             && lock.source == source
             && lock.bin == pkg.bin
+            && lock.lib == pkg.lib
             && lock.subdir == pkg.subdir
             && lock.features == pkg.features
             && lock.default_features == pkg.default_features
@@ -962,6 +973,7 @@ struct ResolvedPackage {
     resolved_rev: Option<String>,
     package_name: Option<String>,
     bin: Option<String>,
+    lib: Option<String>,
     subdir: Option<String>,
     features: Vec<String>,
     default_features: Option<bool>,
@@ -975,6 +987,7 @@ struct PackageLayerSpec {
     source: Option<PackageSource>,
     package: Option<String>,
     bin: Option<String>,
+    lib: Option<String>,
     subdir: Option<String>,
     features: Vec<String>,
     default_features: Option<bool>,
@@ -1108,6 +1121,7 @@ fn resolve_package(
         resolved_rev: None,
         package_name: pkg.package.clone(),
         bin: pkg.bin.clone(),
+        lib: pkg.lib.clone(),
         subdir: pkg
             .subdir
             .as_ref()
@@ -1628,6 +1642,7 @@ fn resolve_layers_into(
                 subdir,
                 package,
                 bin,
+                lib,
                 features,
                 default_features,
                 replace,
@@ -1638,11 +1653,13 @@ fn resolve_layers_into(
                 {
                     continue;
                 }
+                validate_cargo_selectors(bin.as_deref(), lib.as_deref())?;
                 let pkg = PackageLayerSpec {
                     kind: "cargo".to_string(),
                     source: Some(source.clone()),
                     package: package.clone(),
                     bin: bin.clone(),
+                    lib: lib.clone(),
                     subdir: subdir.clone(),
                     features: features.clone(),
                     default_features: *default_features,
@@ -1669,6 +1686,7 @@ fn resolve_layers_into(
                     source: Some(PackageSource::Path(source.clone())),
                     package: None,
                     bin: None,
+                    lib: None,
                     subdir: None,
                     features: Vec::new(),
                     default_features: None,
@@ -4332,6 +4350,33 @@ fn package_build_root(pkg: &ResolvedPackage) -> Result<PathBuf, String> {
     Ok(build_root)
 }
 
+// Scarlet userspace uses ELF shared libraries on every supported architecture.
+// Validate names before using them as paths within Cargo's target directory.
+fn validate_cargo_selectors(bin: Option<&str>, lib: Option<&str>) -> Result<(), String> {
+    if bin.is_some() && lib.is_some() {
+        return Err("cargo layer cannot specify both bin and lib".to_string());
+    }
+    if let Some(name) = lib {
+        if name.is_empty() || !name.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_') {
+            return Err("cargo layer lib must be a Rust library target name".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn cargo_artifact_name(pkg: &ResolvedPackage) -> Result<String, String> {
+    validate_cargo_selectors(pkg.bin.as_deref(), pkg.lib.as_deref())?;
+    Ok(match pkg.lib.as_deref() {
+        Some(name) => format!("lib{name}.so"),
+        None => pkg
+            .bin
+            .as_deref()
+            .or(pkg.package_name.as_deref())
+            .unwrap_or("user-bin")
+            .to_string(),
+    })
+}
+
 fn install_package(
     staging_dir: &Path,
     pkg: &ResolvedPackage,
@@ -4351,7 +4396,7 @@ fn install_package(
         Some("cargo") => {
             let source = package_build_root(pkg)?;
             let package_name = pkg.package_name.as_deref().unwrap_or("user-bin");
-            let bin_name = pkg.bin.as_deref().unwrap_or(package_name);
+            let artifact_name = cargo_artifact_name(pkg)?;
 
             let userspace_triple = userspace_target_triple(target_triple);
             let profile_dir = if profile == "release" {
@@ -4369,7 +4414,7 @@ fn install_package(
             let binary = {
                 eprintln!(
                     "cargo-scarlet: building {} ({}) for {}...",
-                    package_name, bin_name, userspace_triple
+                    package_name, artifact_name, userspace_triple
                 );
                 let mut cmd = if project.join("scarlet.toml").is_file() {
                     project_cargo_command(project)
@@ -4394,6 +4439,8 @@ fn install_package(
                 }
                 if let Some(bin) = pkg.bin.as_deref() {
                     cmd.arg("--bin").arg(bin);
+                } else if pkg.lib.is_some() {
+                    cmd.arg("--lib");
                 }
                 if pkg.default_features == Some(false) {
                     cmd.arg("--no-default-features");
@@ -4409,18 +4456,18 @@ fn install_package(
 
                 if !status.success() {
                     return Err(format!(
-                        "cargo build failed for {} (bin {})",
-                        package_name, bin_name
+                        "cargo build failed for {} ({})",
+                        package_name, artifact_name
                     ));
                 }
 
                 let built = target_dir
                     .join(&userspace_triple)
                     .join(profile_dir)
-                    .join(bin_name);
+                    .join(&artifact_name);
                 if !built.exists() {
                     return Err(format!(
-                        "cargo build succeeded but binary not found: {}",
+                        "cargo build succeeded but artifact not found: {}",
                         built.display()
                     ));
                 }
@@ -4448,6 +4495,7 @@ fn install_package(
                 resolved_rev,
                 package: pkg.package_name.clone(),
                 bin: pkg.bin.clone(),
+                lib: pkg.lib.clone(),
                 subdir: pkg.subdir.clone(),
                 features: pkg.features.clone(),
                 default_features: pkg.default_features,
@@ -4566,6 +4614,7 @@ fn install_package(
                 resolved_rev: None,
                 package: None,
                 bin: None,
+                lib: None,
                 subdir: None,
                 features: Vec::new(),
                 default_features: None,
@@ -6307,6 +6356,7 @@ args = ["--verify"]
             resolved_rev: None,
             package: None,
             bin: Some("sh".to_string()),
+            lib: None,
             subdir: None,
             features: Vec::new(),
             default_features: None,
@@ -6344,6 +6394,7 @@ args = ["--verify"]
             resolved_rev: Some("abc123".to_string()),
             package: None,
             bin: Some("tool".to_string()),
+            lib: None,
             subdir: None,
             features: Vec::new(),
             default_features: None,
@@ -6374,6 +6425,84 @@ hash = "sha256:abc"
             }
             other => panic!("expected LegacyPath, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn cdylib_bundle_resolves_and_roundtrips_lock() {
+        let bundle: BundleManifest = toml::from_str(
+            r#"
+[[layers]]
+kind = "cargo"
+source = "driver"
+package = "example-driver"
+lib = "custom_driver"
+to = "/lib/drivers/custom.so"
+"#,
+        )
+        .unwrap();
+        let project = Path::new("/tmp/cargo-scarlet-cdylib");
+        let ctx = TemplateContext {
+            arch: "aarch64".into(),
+            target_triple: "aarch64-unknown-none-elf".into(),
+            project: project.display().to_string(),
+        };
+        let mut layers = Vec::new();
+        resolve_layers_into(
+            &mut layers,
+            &bundle.layers,
+            project,
+            &ctx,
+            &BTreeMap::new(),
+            &project.join("cache"),
+        )
+        .unwrap();
+        let ResolvedLayer::Package(mut pkg) = layers.remove(0) else {
+            panic!("cargo package")
+        };
+        assert_eq!(cargo_artifact_name(&pkg).unwrap(), "libcustom_driver.so");
+        let lock = package_input_lock(project, &pkg, "sha256:test".into()).unwrap();
+        let layer = package_lock_to_layer(lock);
+        let encoded = toml::to_string(&layer).unwrap();
+        assert!(encoded.contains("lib = \"custom_driver\""));
+        let decoded: LayerLock = toml::from_str(&encoded).unwrap();
+        let section = SectionLock {
+            layers: vec![decoded],
+            hash: String::new(),
+            files: vec![],
+            packages: vec![],
+        };
+        let lock = section.package_locks().next().unwrap();
+        assert!(package_lock_matches_input(project, &lock, &pkg).unwrap());
+        pkg.lib = Some("different_driver".into());
+        assert!(!package_lock_matches_input(project, &lock, &pkg).unwrap());
+        assert!(
+            find_package_lock_for_input(project, &section, &pkg)
+                .unwrap()
+                .is_none()
+        );
+        pkg.lib = None;
+        assert!(!package_lock_matches_input(project, &lock, &pkg).unwrap());
+        assert_eq!(cargo_artifact_name(&pkg).unwrap(), "example-driver");
+    }
+
+    #[test]
+    fn cdylib_rejects_conflicting_and_path_selectors() {
+        assert!(validate_cargo_selectors(Some("tool"), Some("driver")).is_err());
+        for name in [
+            "",
+            "../driver",
+            "/driver",
+            "driver.so",
+            "driver-name",
+            "a/b",
+        ] {
+            assert!(
+                validate_cargo_selectors(None, Some(name)).is_err(),
+                "{name}"
+            );
+        }
+        assert!(validate_cargo_selectors(None, Some("driver_a618")).is_ok());
+        assert!(validate_cargo_selectors(Some("tool"), None).is_ok());
     }
 
     #[test]
@@ -6470,6 +6599,7 @@ to = "/bin/scarlet-ld"
                 subdir: None,
                 package: Some("video_player".to_string()),
                 bin: Some("video_player".to_string()),
+                lib: None,
                 features: vec!["h264-stateful-hw".to_string(), "mp4-aac".to_string()],
                 default_features: Some(false),
                 replace: false,
@@ -6481,6 +6611,7 @@ to = "/bin/scarlet-ld"
                 subdir: None,
                 package: Some("video_player".to_string()),
                 bin: Some("video_player".to_string()),
+                lib: None,
                 features: vec![
                     "h264-stateful-hw".to_string(),
                     "h264-stateless-hw".to_string(),
@@ -6613,6 +6744,7 @@ to = "/system/scarlet/bin/video_player"
             resolved_rev: None,
             package: Some("apps".to_string()),
             bin: Some("sh".to_string()),
+            lib: None,
             subdir: Some("apps".to_string()),
             features: vec!["h264-stateful-hw".to_string()],
             default_features: Some(false),
@@ -6627,6 +6759,7 @@ to = "/system/scarlet/bin/video_player"
             resolved_rev: None,
             package_name: Some("apps".to_string()),
             bin: Some("sh".to_string()),
+            lib: None,
             subdir: Some("apps".to_string()),
             features: vec!["h264-stateful-hw".to_string()],
             default_features: Some(false),
@@ -6669,6 +6802,7 @@ to = "/system/scarlet/bin/video_player"
             resolved_rev: None,
             package_name: Some("test".to_string()),
             bin: Some("test".to_string()),
+            lib: None,
             subdir: Some("examples/widget-factory".to_string()),
             features: Vec::new(),
             default_features: None,

@@ -473,6 +473,7 @@ fn build_inner(
                     resolved_rev: None,
                     package_name: Some(package.clone()),
                     bin: Some(bin.clone()),
+                    lib: None,
                     subdir: None,
                     features: features.clone(),
                     default_features: *default_features,
