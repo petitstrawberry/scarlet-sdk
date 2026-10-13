@@ -113,6 +113,25 @@ bin = "scarlet-ui-widget-factory"
 to = "/bin/widget-factory"
 ```
 
+Cargo layers also build and install ELF shared libraries. Set `lib` to the
+Cargo `[lib].name` (which must declare `crate-type = ["cdylib"]`), instead of
+`bin`. The SDK runs `cargo build --lib` using the same userspace target,
+configuration, package cache and profile as executable layers, then installs
+`lib<name>.so`. The selector and artifact hash are recorded in `scarlet.lock`.
+
+```toml
+[[layers]]
+kind = "cargo"
+source = "../../userspace/example-driver"
+package = "example-driver-plugin"
+lib = "example_driver"
+to = "/lib/sgfx/libexample_driver.so"
+```
+
+`bin` and `lib` cannot be combined. Omitting both retains the existing
+package-name executable behavior. Driver metadata can be installed alongside
+the library with a normal `copy` layer.
+
 Set `architectures` when a Cargo layer is only available for selected target
 architectures. The layer is omitted for other targets:
 
