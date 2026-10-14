@@ -33,8 +33,45 @@ pub extern "C" fn sysconf(name: c_int) -> c_long {
     match name {
         30 => 4096, // _SC_PAGESIZE; Scarlet's architecture-independent PAGE_SIZE
         70 => 4096, // _SC_GETPW_R_SIZE_MAX; upper bound for the synthetic user record
+        84 => {
+            // GetCpuUsageInfo's existing native-width record. Query the online
+            // count from the kernel; std::available_parallelism is still a stub.
+            let mut usage = CpuUsageSnapshot::default();
+            let status = unsafe {
+                scarlet_sys::syscall1(
+                    Syscall::GetCpuUsageInfo,
+                    (&mut usage as *mut CpuUsageSnapshot) as usize,
+                )
+            };
+            match cpu_count_result(status, usage.online_cpus) {
+                Ok(count) => count,
+                Err(error) => crate::fail(error) as c_long,
+            }
+        }
         _ => crate::fail(ERRNO_EINVAL) as c_long,
     }
+}
+
+// Wire layout of the legacy GetCpuUsageInfo syscall, shared by the kernel
+// and native std. This is not a C public structure or a configurable CPU count.
+#[cfg(any(test, target_os = "scarlet"))]
+#[repr(C)]
+#[derive(Default)]
+struct CpuUsageSnapshot {
+    online_cpus: usize,
+    busy_time_ns: u64,
+    idle_time_ns: u64,
+    total_time_ns: u64,
+    usage_per_mille: u32,
+    reserved: u32,
+}
+
+#[cfg(any(test, target_os = "scarlet"))]
+fn cpu_count_result(status: usize, online_cpus: usize) -> Result<c_long, c_int> {
+    if status != 0 || online_cpus == 0 {
+        return Err(ERRNO_EIO);
+    }
+    c_long::try_from(online_cpus).map_err(|_| ERRNO_EOVERFLOW)
 }
 
 #[cfg(target_os = "scarlet")]
@@ -717,5 +754,20 @@ mod tests {
         }
         assert_eq!(random_result(101, 100), Err(ERRNO_EIO));
         assert_eq!(random_result(usize::MAX, 100), Err(ERRNO_EIO));
+    }
+}
+
+#[cfg(test)]
+mod cpu_count_tests {
+    use super::*;
+
+    #[test]
+    fn uses_the_reported_online_count_and_rejects_failure_zero_and_overflow() {
+        assert_eq!(cpu_count_result(0, 4), Ok(4));
+        assert_eq!(cpu_count_result(usize::MAX, 4), Err(ERRNO_EIO));
+        assert_eq!(cpu_count_result(0, 0), Err(ERRNO_EIO));
+        assert_eq!(cpu_count_result(0, usize::MAX), Err(ERRNO_EOVERFLOW));
+        assert_eq!(core::mem::offset_of!(CpuUsageSnapshot, online_cpus), 0);
+        assert_eq!(core::mem::size_of::<CpuUsageSnapshot>(), 40);
     }
 }

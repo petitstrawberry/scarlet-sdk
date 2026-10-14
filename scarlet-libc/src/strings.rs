@@ -287,6 +287,7 @@ pub extern "C" fn strerror(error: c_int) -> *mut c_char {
         29 => c"Illegal seek",
         ERRNO_EROFS => c"Read-only file system",
         32 => c"Broken pipe",
+        crate::ERRNO_EDOM => c"Numerical argument out of domain",
         ERRNO_ERANGE => c"Numerical result out of range",
         35 => c"Resource deadlock avoided",
         ERRNO_ENAMETOOLONG => c"File name too long",

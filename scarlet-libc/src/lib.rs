@@ -25,8 +25,12 @@ use scarlet_abi::Syscall;
 #[cfg(any(test, target_os = "scarlet"))]
 use scarlet_abi::fs::*;
 
+pub(crate) const ERRNO_EDOM: i32 = 33;
+
 pub mod algorithms;
 pub mod allocation;
+#[cfg(any(test, target_os = "scarlet"))]
+mod math_exponent;
 pub mod conversion;
 pub mod descriptor;
 #[cfg(target_os = "scarlet")]

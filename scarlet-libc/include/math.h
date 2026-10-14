@@ -15,6 +15,8 @@
 #define FP_ZERO 2
 #define FP_SUBNORMAL 3
 #define FP_NORMAL 4
+#define FP_ILOGB0 (-2147483647 - 1)
+#define FP_ILOGBNAN FP_ILOGB0
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -114,6 +116,8 @@ double ldexp(double, int);
 float ldexpf(float, int);
 double scalbn(double, int);
 float scalbnf(float, int);
+int ilogb(double);
+int ilogbf(float);
 double frexp(double, int *);
 float frexpf(float, int *);
 double modf(double, double *);

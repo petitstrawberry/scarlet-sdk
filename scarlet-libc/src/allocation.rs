@@ -63,6 +63,20 @@ pub extern "C" fn malloc(size: usize) -> *mut c_void {
     allocation_result(allocate(size, ALIGN))
 }
 
+/// Return the writable payload extent owned by this allocator, excluding its
+/// private prefix and alignment padding. Rust allocator slack is not exposed.
+///
+/// # Safety
+/// ptr is null or a live allocation returned by this library's allocation API.
+#[cfg_attr(target_os = "scarlet", unsafe(no_mangle))]
+pub unsafe extern "C" fn malloc_usable_size(ptr: *mut c_void) -> usize {
+    if ptr.is_null() {
+        return 0;
+    }
+    let header = unsafe { ptr.cast::<Header>().sub(1).read() };
+    header.layout.size() - header.offset
+}
+
 /// Allocate at a nonzero power-of-two alignment, retaining fundamental
 /// alignment. Size need not be a multiple of alignment.
 #[cfg_attr(target_os = "scarlet", unsafe(no_mangle))]
@@ -182,6 +196,26 @@ mod tests {
     fn set_errno(value: c_int) {
         // SAFETY: errno is a live cell owned by this thread.
         unsafe { crate::__errno_location().write(value) };
+    }
+
+    #[test]
+    fn usable_size_matches_the_owned_payload_and_preserves_errno() {
+        unsafe {
+            set_errno(77);
+            assert_eq!(malloc_usable_size(ptr::null_mut()), 0);
+            for alignment in [16, 64, 4096] {
+                for size in [0, 1, 19, 8193] {
+                    let p = aligned_alloc(alignment, size);
+                    assert!(!p.is_null());
+                    assert_eq!(malloc_usable_size(p), size.max(1));
+                    ptr::write_bytes(p.cast::<u8>(), 0x5a, malloc_usable_size(p));
+                    let p = realloc(p, 37);
+                    assert_eq!(malloc_usable_size(p), 37);
+                    assert_eq!(errno(), 77);
+                    free(p);
+                }
+            }
+        }
     }
 
     #[test]

@@ -7,6 +7,7 @@
 #include <sys/random.h>
 #include <sys/time.h>
 #include <time.h>
+#include <unistd.h>
 
 #define CHECK(expression) do { if (!(expression)) return __LINE__; } while (0)
 
@@ -42,6 +43,7 @@ int scarlet_libc_abort_test(void) {
 }
 
 int scarlet_libc_runtime_test(void) {
+    CHECK(sysconf(_SC_NPROCESSORS_ONLN) > 0);
     static_assert(sizeof(struct timespec) == 16, "timespec ABI");
     static_assert(sizeof(struct timeval) == 16, "timeval ABI");
     CHECK(assert_once() == 1 && assert_disabled() == 0 && assert_enabled_again() == 1);
