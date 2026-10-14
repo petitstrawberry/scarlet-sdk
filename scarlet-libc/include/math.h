@@ -83,6 +83,9 @@ long long llroundf(float);
 double rint(double);
 float rintf(float);
 long lrint(double);
+long lrintf(float);
+double fma(double, double, double);
+float fmaf(float, float, float);
 double atan2(double, double);
 float atan2f(float, float);
 /* Declaration needed to parse libc++'s unused long-double arg template.

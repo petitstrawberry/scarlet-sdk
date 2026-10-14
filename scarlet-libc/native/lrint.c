@@ -17,3 +17,11 @@ long lrint(double value)
         : "=r"(result), "+w"(value));
     return result;
 }
+
+long lrintf(float value)
+{
+    long result;
+    __asm__ volatile("frintx %s1, %s1\n\tfcvtzs %0, %s1"
+        : "=r"(result), "+w"(value));
+    return result;
+}

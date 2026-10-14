@@ -17,7 +17,7 @@ endif()
 add_library(scarlet_cxx_support STATIC
     exit.cpp float-conversion.cpp locale.c locale-perror.c path-extensions.c
     temporary-files.c tmpfile.c rand.c scanf.cpp setjmp.cpp longjmp.cpp
-    fenv-aarch64.c lrint.c math-round.c)
+    fenv-aarch64.c lrint.c fma-aarch64.c math-round.c)
 add_library(Scarlet::CXXSupport ALIAS scarlet_cxx_support)
 set_target_properties(scarlet_cxx_support PROPERTIES
     EXPORT_NAME CXXSupport
