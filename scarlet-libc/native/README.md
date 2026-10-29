@@ -11,7 +11,8 @@ implementation, C++ standard library or operating-system ABI.
 
 The SDK builds this source with its pinned LLVM libc source checkout. Numeric
 conversion uses LLVM's shared header-only core; LLVM sources are not copied
-into this module. `SCARLET_LLVM_LIBC_SOURCE_DIR` names the LLVM `libc` directory
+into this module. Formatting uses its printf/strftime cores and calendar
+utilities. `SCARLET_LLVM_LIBC_SOURCE_DIR` names the LLVM `libc` directory
 containing `shared/str_to_float.h` and `src/__support/str_to_float.h`. The
 validated dependency version is LLVM 21.1.8.
 
@@ -66,9 +67,15 @@ and does not replace or suppress any callback.
 
 - C locale `strtof`, `strtod`, `strtold` and `atof` use LLVM conversion,
   preserve end pointers and report conversion errors through native errno.
-- `setlocale` accepts queries and `C`/`POSIX`; other names fail with `ENOENT`.
-  `localeconv` supplies the C locale. `perror` writes to the real stderr
-  stream and preserves errno.
+- `setlocale`, `newlocale`, `duplocale`, `freelocale`, and `uselocale` support
+  C/POSIX locales. Empty names resolve the environment and unsupported names
+  fail with `ENOENT`. Locale selection uses pthread keys rather than DSO TLS;
+  objects retain independent ownership. Classification, collation, transform
+  and numeric `_l` functions use the C locale. `localeconv` supplies its data.
+  `perror` writes to the real stderr stream and preserves errno.
+- `strftime` and `strftime_l` format C/POSIX names and calendar fields using
+  LLVM's core. `%z` and `%Z` use the supplied `tm_gmtoff` and `tm_zone` when
+  `tm_isdst` is known. No timezone database or additional locales are supplied.
 - `sscanf`/`vsscanf` parse byte strings, scansets, integers and float/double,
   with widths, suppression and accurate conversion counts. Wide text,
   long-double scanner directives, allocation, positional and unknown
@@ -92,8 +99,19 @@ and does not replace or suppress any callback.
   `AT_FDCWD` or absolute paths, and `AT_REMOVEDIR`; relative directory handles
   return `ENOTSUP`. Native `mprotect` belongs to Rust libc `mapping.rs`.
 
-Floating-point printf remains outside this companion. The built-in formatter
-continues to report unsupported floating conversions explicitly.
+The integrated native runtime builds Rust libc with `external-format` and
+uses this companion's LLVM printf provider. Buffer, stream and allocating
+printf functions include floating-point conversions and use the real AArch64
+rounding mode. Stream formatting allocates its complete output before one
+write. GNU `%m`, wide text and locale-specific grouping are not supplied.
+Standalone Rust libc builds retain the integer formatter unless the feature
+and a matching provider are selected together.
+
+The SDK builds libc++/libc++abi as position independent archives. Narrow C++
+streams and C/POSIX locale facets are enabled; wide-character streams and C++
+exceptions remain disabled. The validated consumer uses `-fno-rtti`.
+This supports static C++ dependencies
+inside native shared libraries without text relocations or ELF DSO TLS.
 
 The public `uchar.h` supplies C `char16_t`/`char32_t` typedefs and uses C++'s
 native keywords. It exposes the existing reserved `mbstate_t` storage layout

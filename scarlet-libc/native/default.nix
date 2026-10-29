@@ -18,7 +18,7 @@ let
     inherit cargoLock;
     buildPhase = ''
       runHook preBuild
-      cargo build --locked --offline --release --target ${target}
+      cargo build --locked --offline --release --features external-format --target ${target}
       runHook postBuild
     '';
     installPhase = ''
@@ -49,6 +49,7 @@ pkgs.stdenvNoCC.mkDerivation {
     flags="-nostdinc -isystem $resource/include -isystem $headers -D__scarlet__=1 -fno-stack-protector -mno-outline-atomics"
     common=(
       -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_LIBDIR=lib
+      -DCMAKE_POSITION_INDEPENDENT_CODE=ON
       "-DCMAKE_TOOLCHAIN_FILE=$toolchain"
       "-DCMAKE_C_COMPILER=$cross_cc" "-DCMAKE_CXX_COMPILER=$cross_cxx"
       -DCMAKE_AR=${llvm}/bin/llvm-ar -DCMAKE_RANLIB=${llvm}/bin/llvm-ranlib
@@ -71,7 +72,8 @@ pkgs.stdenvNoCC.mkDerivation {
       -DLIBCXX_ENABLE_SHARED=OFF -DLIBCXXABI_ENABLE_SHARED=OFF \
       -DLIBCXX_ENABLE_EXCEPTIONS=OFF -DLIBCXXABI_ENABLE_EXCEPTIONS=OFF \
       -DLIBCXXABI_USE_LLVM_UNWINDER=OFF -DLIBCXXABI_USE_COMPILER_RT=OFF \
-      -DLIBCXX_ENABLE_RANDOM_DEVICE=OFF -DLIBCXX_ENABLE_LOCALIZATION=OFF \
+      -DLIBCXX_ENABLE_RANDOM_DEVICE=OFF -DLIBCXX_ENABLE_LOCALIZATION=ON \
+      -DLIBCXX_EXTRA_SITE_DEFINES=_LIBCPP_PROVIDES_DEFAULT_RUNE_TABLE \
       -DLIBCXX_ENABLE_WIDE_CHARACTERS=OFF \
       -DLIBCXX_ENABLE_TIME_ZONE_DATABASE=OFF -DLIBCXX_HAS_TERMINAL_AVAILABLE=OFF
     cmake --build cxx --parallel "$NIX_BUILD_CORES"
@@ -95,10 +97,31 @@ pkgs.stdenvNoCC.mkDerivation {
       -D__scarlet__=1 -std=c++20 -O2 -fno-exceptions -fno-rtti \
       -fno-stack-protector -mno-outline-atomics \
       -c tests/native-runtime-link.cpp -o native-runtime-link.o
+    ${clang}/bin/clang++ --target=aarch64-unknown-none-elf \
+      -nostdinc -nostdinc++ -isystem "$out/include/c++/v1" \
+      -isystem "$out/include" -isystem "$resource/include" \
+      -D__scarlet__=1 -std=c++20 -O2 -fPIC -fvisibility=hidden \
+      -fno-exceptions -fno-rtti -fno-stack-protector -mno-outline-atomics \
+      -c tests/native-runtime-shared.cpp -o native-runtime-shared.o
+    ${lld}/bin/ld.lld -shared --gc-sections -z max-page-size=4096 \
+      --exclude-libs ALL native-runtime-shared.o --start-group \
+      "$out/lib/libc++.a" "$out/lib/libc++abi.a" \
+      "$out/lib/libscarlet_cxx_support.a" --end-group \
+      -o libnative-runtime-shared.so
+    python3 - <<'PY'
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, "tests")
+    from elf_audit import Elf
+    report = Elf(Path("libnative-runtime-shared.so")).report()
+    assert report["machine"] == "aarch64", report
+    assert not report["tls"] and not report["textrel"], report
+    assert set(report["relocations"]) <= {"ABS64", "GLOB_DAT", "JUMP_SLOT", "RELATIVE"}, report
+    PY
     ${lld}/bin/ld.lld -static --gc-sections --no-undefined -e _start \
       --wrap=main --undefined=__wrap_main -z max-page-size=4096 \
       ${rustToolchain}/lib/rustlib/${target}/lib/scarlet-crt0.o \
-      native-runtime-link.o --start-group \
+      native-runtime-link.o native-runtime-shared.o --start-group \
       "$out/lib/libc++.a" "$out/lib/libc++abi.a" \
       "$out/lib/libscarlet_c_startup.a" "$out/lib/libscarlet_cxx_support.a" \
       "$out/lib/libscarlet_c.a" --end-group -o native-runtime-link

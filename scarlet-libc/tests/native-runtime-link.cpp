@@ -9,7 +9,10 @@
 #include <malloc.h>
 #include <unistd.h>
 
+extern "C" int scarlet_runtime_shared_probe();
+
 int main() {
+    if (int result = scarlet_runtime_shared_probe()) return 20 + result;
     long (*volatile cpus)(int) = sysconf;
     int (*volatile exponent)(float) = ilogbf;
     size_t (*volatile capacity)(void*) = malloc_usable_size;
