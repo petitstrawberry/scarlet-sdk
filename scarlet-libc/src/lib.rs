@@ -44,11 +44,15 @@ mod inet;
 mod ioctl;
 #[cfg(target_os = "scarlet")]
 mod mapping;
+#[cfg(target_os = "scarlet")]
+mod network;
 pub mod path;
 #[cfg(target_os = "scarlet")]
 mod polling;
 #[cfg(target_os = "scarlet")]
 mod passwd;
+#[cfg(target_os = "scarlet")]
+mod pipe;
 pub mod pthread_sync;
 #[cfg(any(test, target_os = "scarlet"))]
 mod resolver;
