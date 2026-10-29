@@ -43,6 +43,8 @@ int link(const char *, const char *);
 char *getcwd(char *, size_t);
 off_t lseek(int, off_t, int);
 int dup(int);
+int pipe(int [2]);
+int pipe2(int [2], int);
 int fsync(int);
 int fdatasync(int);
 int access(const char *, int);
