@@ -104,6 +104,8 @@ uses this companion's LLVM printf provider. Buffer, stream and allocating
 printf functions include floating-point conversions and use the real AArch64
 rounding mode. Stream formatting allocates its complete output before one
 write. GNU `%m`, wide text and locale-specific grouping are not supplied.
+`setvbuf` and `setbuf` accept unbuffered operation, matching the actual stream
+backend; buffering requests fail with `ENOTSUP`.
 Standalone Rust libc builds retain the integer formatter unless the feature
 and a matching provider are selected together.
 

@@ -15,6 +15,13 @@
 #include <fenv.h>
 
 extern "C" __attribute__((visibility("default"))) int scarlet_runtime_shared_probe() {
+    if (setvbuf(stdout, nullptr, _IONBF, 0)) return 20;
+    char streamBuffer[BUFSIZ];
+    errno = 0;
+    if (setvbuf(stdout, streamBuffer, _IOFBF, sizeof(streamBuffer)) == 0 || errno != ENOTSUP) return 21;
+    errno = 0;
+    setbuf(stdout, nullptr);
+    if (errno != 0) return 22;
     char formatted[64];
     if (std::snprintf(formatted, sizeof(formatted), "%+.2f %a %.3e", 1.25, 1.5, 1.25) != 24 ||
         std::strcmp(formatted, "+1.25 0x1.8p+0 1.250e+00")) return 14;
