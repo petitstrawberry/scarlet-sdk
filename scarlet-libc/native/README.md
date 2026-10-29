@@ -35,7 +35,8 @@ builtin headers, without host C/C++ include directories or libraries. LLVM
 support must come from the SDK's declared dependency revision. An installed
 SDK toolchain may instead select the native target and include paths itself.
 Build the Rust libc for `aarch64-unknown-scarlet` with the matching Scarlet
-Rust toolchain and install `libscarlet_c.a` in the same prefix.
+Rust toolchain and `--features external-format`, then install `libscarlet_c.a`
+in the same prefix. The feature selects this companion's printf provider.
 
 CMake consumers use `find_package(ScarletCXXSupport CONFIG REQUIRED)` and
 `Scarlet::CXXSupport`. The package installs public Scarlet libc headers and
