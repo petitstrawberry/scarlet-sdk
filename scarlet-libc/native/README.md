@@ -73,6 +73,10 @@ and does not replace or suppress any callback.
   objects retain independent ownership. Classification, collation, transform
   and numeric `_l` functions use the C locale. `localeconv` supplies its data.
   `perror` writes to the real stderr stream and preserves errno.
+- Unnamed semaphores use the real native pthread mutex and condition APIs.
+  Wait, try-wait, realtime timed wait, post and value queries are supported.
+  Process-shared and named semaphores are not supplied. Native waits do not
+  implement POSIX signal interruption or cancellation.
 - `strftime` and `strftime_l` format C/POSIX names and calendar fields using
   LLVM's core. `%z` and `%Z` use the supplied `tm_gmtoff` and `tm_zone` when
   `tm_isdst` is known. No timezone database or additional locales are supplied.

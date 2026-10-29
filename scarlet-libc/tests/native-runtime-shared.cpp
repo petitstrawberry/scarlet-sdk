@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fenv.h>
+#include <semaphore.h>
 
 extern "C" __attribute__((visibility("default"))) int scarlet_runtime_shared_probe() {
     if (setvbuf(stdout, nullptr, _IONBF, 0)) return 20;
@@ -22,6 +23,21 @@ extern "C" __attribute__((visibility("default"))) int scarlet_runtime_shared_pro
     errno = 0;
     setbuf(stdout, nullptr);
     if (errno != 0) return 22;
+    sem_t semaphore;
+    if (sem_init(&semaphore, 0, 0)) return 23;
+    errno = 0;
+    if (sem_trywait(&semaphore) != -1 || errno != EAGAIN) return 24;
+    std::thread signal([&] { sem_post(&semaphore); });
+    int waited = sem_wait(&semaphore);
+    signal.join();
+    if (waited) return 25;
+    struct timespec expired = {0, 0};
+    errno = 0;
+    if (sem_timedwait(&semaphore, &expired) != -1 || errno != ETIMEDOUT) return 26;
+    int count = -1;
+    if (sem_getvalue(&semaphore, &count) || count != 0 || sem_destroy(&semaphore)) return 27;
+    errno = 0;
+    if (sem_init(&semaphore, 1, 0) != -1 || errno != ENOTSUP) return 28;
     char formatted[64];
     if (std::snprintf(formatted, sizeof(formatted), "%+.2f %a %.3e", 1.25, 1.5, 1.25) != 24 ||
         std::strcmp(formatted, "+1.25 0x1.8p+0 1.250e+00")) return 14;
@@ -30,7 +46,7 @@ extern "C" __attribute__((visibility("default"))) int scarlet_runtime_shared_pro
         std::strcmp(formatted, "1.25")) return 17;
     int rounding = fegetround();
     if (fesetround(FE_DOWNWARD)) return 18;
-    int count = std::snprintf(formatted, sizeof(formatted), "%.0f", 2.75);
+    count = std::snprintf(formatted, sizeof(formatted), "%.0f", 2.75);
     int downward = !std::strcmp(formatted, "2");
     if (fesetround(rounding) || count != 1 || !downward) return 19;
     std::ostringstream output;

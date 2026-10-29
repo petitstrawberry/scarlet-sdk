@@ -15,7 +15,7 @@ if(NOT EXISTS "${SCARLET_LLVM_LIBC_SOURCE_DIR}/shared/str_to_float.h"
 endif()
 
 add_library(scarlet_cxx_support STATIC
-    exit.cpp float-conversion.cpp printf.cpp locale.c locale-perror.c strftime.cpp stream-config.c path-extensions.c
+    exit.cpp float-conversion.cpp printf.cpp locale.c locale-perror.c strftime.cpp stream-config.c semaphore.c path-extensions.c
     temporary-files.c tmpfile.c rand.c scanf.cpp setjmp.cpp longjmp.cpp
     fenv-aarch64.c lrint.c fma-aarch64.c math-round.c)
 target_sources(scarlet_cxx_support PRIVATE "${SCARLET_LLVM_LIBC_SOURCE_DIR}/src/time/time_utils.cpp")
