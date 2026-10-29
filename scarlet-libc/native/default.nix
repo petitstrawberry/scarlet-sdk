@@ -85,6 +85,7 @@ pkgs.stdenvNoCC.mkDerivation {
     cp ${libc}/lib/libscarlet_c.a "$out/lib/"
     mkdir -p "$out/share/licenses/LLVM"
     cp ${llvmSource}/LICENSE.TXT "$out/share/licenses/LLVM/"
+    cp ${../../LICENSE} "$out/share/licenses/ScarletSDK.txt"
     runHook postInstall
   '';
   doInstallCheck = true;
