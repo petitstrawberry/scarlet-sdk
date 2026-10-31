@@ -2645,7 +2645,7 @@ fn build_manifest_image(
         match format {
             "newc" | "ext2" | "gpt-ext2" => {
                 if staging_dir.exists() {
-                    fs::remove_dir_all(&staging_dir)
+                    cache::remove_tree(&staging_dir)
                         .map_err(|e| format!("failed to clean staging: {e}"))?;
                 }
                 fs::create_dir_all(&staging_dir)
@@ -7838,8 +7838,7 @@ to = "/system"
                 0o444
             );
         }
-        fs::set_permissions(dest.join("licenses"), fs::Permissions::from_mode(0o755)).unwrap();
-        fs::remove_dir_all(temp).unwrap();
+        cache::remove_tree(&temp).unwrap();
     }
 
     #[test]
