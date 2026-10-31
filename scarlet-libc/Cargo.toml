@@ -1,0 +1,30 @@
+[package]
+name = "scarlet-libc"
+version = "0.1.0"
+edition = "2024"
+description = "Rust std-backed C runtime for the Scarlet Native ABI"
+links = "scarlet_c"
+
+[workspace]
+
+[features]
+# Let a freestanding external formatter provide printf-family symbols.
+# Default builds retain the built-in integer-only implementation.
+external-format = []
+
+[lib]
+name = "scarlet_c"
+crate-type = ["rlib", "staticlib"]
+
+[dependencies]
+scarlet-abi = { git = "https://github.com/petitstrawberry/Scarlet", rev = "c6a831d2120c49e3d68c2839e20374d412afd015" }
+libm = "=0.2.16"
+
+[target.'cfg(target_os = "scarlet")'.dependencies]
+scarlet-sys = { git = "https://github.com/petitstrawberry/Scarlet", rev = "c6a831d2120c49e3d68c2839e20374d412afd015" }
+
+[profile.release]
+panic = "abort"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("scarlet"))'] }

@@ -2645,7 +2645,7 @@ fn build_manifest_image(
         match format {
             "newc" | "ext2" | "gpt-ext2" => {
                 if staging_dir.exists() {
-                    fs::remove_dir_all(&staging_dir)
+                    cache::remove_tree(&staging_dir)
                         .map_err(|e| format!("failed to clean staging: {e}"))?;
                 }
                 fs::create_dir_all(&staging_dir)
@@ -3939,6 +3939,7 @@ fn extract_archive_entries<R: Read>(
     strip_components: usize,
     dest_root: &Path,
 ) -> Result<(), String> {
+    let mut directory_modes = BTreeMap::new();
     for entry in archive
         .entries()
         .map_err(|error| format!("failed to read archive entries: {error}"))?
@@ -4048,6 +4049,11 @@ fn extract_archive_entries<R: Read>(
             fs::create_dir_all(parent)
                 .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
             ensure_no_symlink_ancestors(dest_root, &dest)?;
+            // Replace a previous read-only regular file without changing its mode.
+            if fs::symlink_metadata(&dest).is_ok_and(|metadata| metadata.is_file()) {
+                fs::remove_file(&dest)
+                    .map_err(|error| format!("failed to replace {}: {error}", dest.display()))?;
+            }
             let mut file = fs::File::create(&dest)
                 .map_err(|error| format!("failed to create {}: {error}", dest.display()))?;
             std::io::copy(&mut entry, &mut file)
@@ -4069,10 +4075,14 @@ fn extract_archive_entries<R: Read>(
                 entry.header().mode().map_err(|error| {
                     format!("failed to read mode for {}: {error}", path.display())
                 })? & (0o7777 & !0o7000);
-            fs::set_permissions(&dest, std::os::unix::fs::PermissionsExt::from_mode(mode))
-                .map_err(|error| {
-                    format!("failed to set permissions on {}: {error}", dest.display())
-                })?;
+            // Keep directories writable while their children are extracted,
+            // including when retrying a partially extracted read-only tree.
+            fs::set_permissions(
+                &dest,
+                std::os::unix::fs::PermissionsExt::from_mode(mode | 0o700),
+            )
+            .map_err(|error| format!("failed to set permissions on {}: {error}", dest.display()))?;
+            directory_modes.insert(dest, mode);
         } else {
             let target = entry
                 .link_name()
@@ -4107,6 +4117,14 @@ fn extract_archive_entries<R: Read>(
                 )
             })?;
         }
+    }
+    // Restrict children before their parents, so a parent without search
+    // permission cannot prevent restoring a descendant's archived mode.
+    let mut directories: Vec<_> = directory_modes.into_iter().collect();
+    directories.sort_by_key(|(path, _)| std::cmp::Reverse(path.components().count()));
+    for (path, mode) in directories {
+        fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(mode))
+            .map_err(|error| format!("failed to set permissions on {}: {error}", path.display()))?;
     }
     Ok(())
 }
@@ -7772,6 +7790,55 @@ to = "/system"
             Path::new("usr/lib")
         );
         fs::remove_dir_all(&temp).unwrap();
+    }
+
+    #[test]
+    fn test_extract_readonly_directory_and_replace_readonly_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = archive_test_dir("archive-readonly-directory");
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut directory = tar::Header::new_gnu();
+        directory.set_entry_type(tar::EntryType::dir());
+        directory.set_size(0);
+        directory.set_mode(0o555);
+        directory.set_cksum();
+        builder
+            .append_data(&mut directory, "licenses", std::io::empty())
+            .unwrap();
+        let mut file = tar::Header::new_gnu();
+        file.set_size(7);
+        file.set_mode(0o444);
+        file.set_cksum();
+        builder
+            .append_data(&mut file, "licenses/LICENSE.TXT", &b"license"[..])
+            .unwrap();
+        builder.finish().unwrap();
+        let archive = write_archive_fixture(&temp, "archive.tar", &builder.into_inner().unwrap());
+        let dest = temp.join("dest");
+        for _ in 0..2 {
+            extract_archive_safe(&archive, ArchiveFormat::Tar, 0, &dest).unwrap();
+            assert_eq!(
+                fs::read(dest.join("licenses/LICENSE.TXT")).unwrap(),
+                b"license"
+            );
+            assert_eq!(
+                fs::metadata(dest.join("licenses"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o555
+            );
+            assert_eq!(
+                fs::metadata(dest.join("licenses/LICENSE.TXT"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o444
+            );
+        }
+        cache::remove_tree(&temp).unwrap();
     }
 
     #[test]

@@ -25,6 +25,28 @@ cargo install --path cargo-scarlet-plugin-limine
 | `cargo-scarlet` | `cargo-scarlet` | Build system CLI — reads `scarlet.toml`, builds kernel, composes images |
 | `cargo-scarlet-plugin-limine` | `cargo-scarlet-plugin-limine` | Limine UEFI boot image plugin |
 
+## Native C/C++ runtime
+
+[`scarlet-libc`](scarlet-libc/README.md) owns the native C runtime, public C
+headers, and C/C++ support sources. It is a standalone Cargo package, excluded
+from the host-tool workspace. Its ABI and syscall crates are pinned dependencies
+from Scarlet; the SDK does not duplicate the operating-system ABI definitions.
+
+The AArch64 C/C++ runtime is provided as a separate Nix package:
+
+```sh
+nix build .#scarlet-native-runtime --no-link
+```
+
+It installs `libscarlet_c.a`, libc++, libc++abi, the C/C++ support archives,
+headers, and `share/scarlet/cmake/aarch64-scarlet.cmake`. Nix owns its build
+directory and store output. The CLI packages do not link the target runtime.
+Engine-specific bridges and libraries remain with their consumers.
+The runtime installation check links filesystem, strings, containers and
+thread support into a real AArch64 ELF. Native Rust applications use the
+Scarlet compiler for the final link and OSABI. This package does not yet
+provide a standalone Native C/C++ compiler driver or establish guest execution.
+
 ## Host Dependencies
 
 Image generation uses external filesystem and disk-image tools:
