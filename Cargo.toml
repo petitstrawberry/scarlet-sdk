@@ -4,3 +4,4 @@ members = [
     "cargo-scarlet",
     "cargo-scarlet-plugin-limine",
 ]
+exclude = ["scarlet-libc"]

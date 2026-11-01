@@ -444,7 +444,7 @@ fn make_directories_writable(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn remove_tree(path: &Path) -> Result<(), String> {
+pub(crate) fn remove_tree(path: &Path) -> Result<(), String> {
     if !real_directory(path)? {
         return Err(format!(
             "refusing to remove {}: expected a directory",

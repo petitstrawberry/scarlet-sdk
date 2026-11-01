@@ -1,5 +1,5 @@
 {
-  description = "Scarlet SDK build tools";
+  description = "Scarlet SDK build tools and native C/C++ runtime";
 
   nixConfig = {
     extra-substituters = [ "https://scarlet-rust-toolchain.cachix.org" ];
@@ -10,7 +10,15 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
-    scarlet-rust-toolchain.url = "github:petitstrawberry/scarlet-rust-nix";
+    scarlet-rust-toolchain.url = "github:petitstrawberry/scarlet-rust-nix/3c23906c35053e28d56f3aa9b1d29142535ffab7";
+    llvm-src = {
+      url = "github:petitstrawberry/llvm-project/5733bea91affcb26db1f9f4d7459b22c79756c13";
+      flake = false;
+    };
+    scarlet-abi-src = {
+      url = "github:petitstrawberry/Scarlet/c6a831d2120c49e3d68c2839e20374d412afd015";
+      flake = false;
+    };
   };
 
   outputs =
@@ -18,6 +26,8 @@
       self,
       nixpkgs,
       scarlet-rust-toolchain,
+      llvm-src,
+      scarlet-abi-src,
     }:
     let
       supportedSystems = [
@@ -90,6 +100,11 @@
         {
           packages = {
             inherit cargo-scarlet cargo-scarlet-plugin-limine;
+            scarlet-native-runtime = import ./scarlet-libc/native/default.nix {
+              inherit pkgs rustToolchain;
+              llvmSource = llvm-src;
+              scarletAbiHash = scarlet-abi-src.narHash;
+            };
             default = cargo-scarlet;
           };
           devShell = pkgs.mkShell {
@@ -106,6 +121,9 @@
     in
     {
       packages = forAllSystems (system: (mkSystem system).packages);
+      checks = forAllSystems (system: {
+        scarlet-libc = (mkSystem system).packages.scarlet-native-runtime.tests.libc;
+      });
       devShells = forAllSystems (system: {
         default = (mkSystem system).devShell;
       });

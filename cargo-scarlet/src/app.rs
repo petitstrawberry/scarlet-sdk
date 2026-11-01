@@ -384,7 +384,20 @@ pub fn validate(root: &Path, target: &str) -> Result<(), String> {
             return Err("app executable lacks executable permissions".into());
         }
     }
-    native_elf(&root.join(executable), target)?;
+    let file = fs::File::open(root.join(executable)).map_err(|e| e.to_string())?;
+    let mut header = Vec::new();
+    file.take(256)
+        .read_to_end(&mut header)
+        .map_err(|e| e.to_string())?;
+    let end = header.iter().position(|&byte| byte == b'\n');
+    let shell_script = (end.is_some() || header.len() < 256)
+        && std::str::from_utf8(&header[..end.unwrap_or(header.len())])
+            .ok()
+            .and_then(|line| line.strip_prefix("#!"))
+            .is_some_and(|interpreter| interpreter.trim() == "/bin/sh");
+    if !shell_script {
+        native_elf(&root.join(executable), target)?;
+    }
     for key in ["Icon", "X-Scarlet-Background"] {
         if let Some(value) = fields.get(key) {
             if key == "X-Scarlet-Background" || value.contains('/') {
@@ -661,6 +674,14 @@ to = "resources/art.png"
         build(&built, &renamed, "aarch64-unknown-scarlet", false, &f.0).unwrap();
         assert_eq!(sha256_dir(&built).unwrap(), sha256_dir(&renamed).unwrap());
     }
+    #[test]
+    fn packages_system_shell_entry_points() {
+        let f = Fixture::new();
+        fs::write(f.0.join("source/player"), b"#!/bin/sh\necho ok\n").unwrap();
+        f.build().unwrap();
+        validate(&f.0.join("player.app"), "aarch64-unknown-scarlet").unwrap();
+    }
+
     #[test]
     fn failed_build_is_not_published_and_existing_output_is_preserved() {
         let f = Fixture::new();
