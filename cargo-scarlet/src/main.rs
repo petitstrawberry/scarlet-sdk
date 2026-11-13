@@ -1,4 +1,5 @@
 mod app;
+mod metadata;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::fs;
@@ -11,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 mod cache;
+use metadata::*;
 
 #[derive(Parser, Debug)]
 #[command(name = "cargo-scarlet")]
@@ -2620,6 +2622,7 @@ fn build_manifest_image(
     } else {
         existing_lock.clone()
     };
+    let mut metadata_by_section: BTreeMap<String, CompositionMetadata> = BTreeMap::new();
 
     for section_name in build_order {
         let section_cfg = expanded
@@ -2654,6 +2657,7 @@ fn build_manifest_image(
                 let cache_dir = project.join(".scarlet/cache/files");
                 let prev_section_lock = existing_lock.sections.get(&section_name);
                 let mut layer_locks: Vec<LayerLock> = Vec::new();
+                let mut metadata = CompositionMetadata::default();
 
                 for layer in &resolved.layers {
                     match layer {
@@ -2665,6 +2669,7 @@ fn build_manifest_image(
                                 prev_section_lock,
                                 &tpl_ctx,
                                 &mut layer_locks,
+                                &mut metadata,
                             )?;
                         }
                         ResolvedLayer::Archive(archive) => {
@@ -2673,6 +2678,7 @@ fn build_manifest_image(
                                 &staging_dir,
                                 &cache_dir,
                                 &mut layer_locks,
+                                &mut metadata,
                             )?;
                         }
                         ResolvedLayer::Package(pkg) => {
@@ -2682,13 +2688,14 @@ fn build_manifest_image(
                                         package_lock_matches_input(project, p, pkg).unwrap_or(false)
                                     })
                                 });
-                            if let Some(lock) = install_package(
+                            if let Some(lock) = install_package_with_metadata(
                                 &staging_dir,
                                 pkg,
                                 project,
                                 &target_triple,
                                 profile,
                                 prev_pkg.as_ref(),
+                                &mut metadata,
                             )? {
                                 layer_locks.push(package_lock_to_layer(lock));
                             }
@@ -2696,6 +2703,7 @@ fn build_manifest_image(
                         ResolvedLayer::App { source, to } => {
                             let destination = staging_dir.join(to.trim_start_matches('/'));
                             ensure_no_symlink_ancestors(&staging_dir, &destination)?;
+                            metadata.invalidate(Path::new(to.trim_start_matches('/')));
                             app::build(
                                 source,
                                 &destination,
@@ -2713,23 +2721,33 @@ fn build_manifest_image(
                             let from_staging = project.join(format!(".scarlet/staging/{}", source));
                             let dest = staging_dir.join(to.trim_start_matches('/'));
                             if from_staging.is_dir() {
-                                copy_dir_recursive(&from_staging, &dest)?;
+                                copy_composed_tree(
+                                    &from_staging,
+                                    &dest,
+                                    &staging_dir,
+                                    metadata_by_section.get(source),
+                                    &mut metadata,
+                                )?;
                             } else {
                                 let image_path =
                                     image_output_path(project, &expanded.manifest.images, source)?;
                                 copy_path_or_dir(&image_path, &dest)?;
+                                metadata.invalidate(Path::new(to.trim_start_matches('/')));
                             }
                         }
                     }
                 }
 
                 let staging_hash = sha256_dir(&staging_dir)?;
+                let metadata_hash = metadata.digest();
                 let image_hash = image_content_hash(
                     format,
                     &staging_hash,
+                    &metadata_hash,
                     section_cfg.min_size_mib,
                     section_cfg.size_mib,
                 );
+                metadata_by_section.insert(section_name.clone(), metadata.clone());
 
                 let existing_section_lock = existing_lock.sections.get(&section_name);
                 if image_output_is_current(
@@ -2765,6 +2783,7 @@ fn build_manifest_image(
                     "ext2" => {
                         build_ext2_from_staging(
                             &staging_dir,
+                            &metadata,
                             &output_path,
                             &section_name,
                             section_cfg.min_size_mib,
@@ -2774,6 +2793,7 @@ fn build_manifest_image(
                     "gpt-ext2" => {
                         build_gpt_ext2_from_staging(
                             &staging_dir,
+                            &metadata,
                             &output_path,
                             &section_name,
                             section_cfg.min_size_mib,
@@ -3062,13 +3082,16 @@ fn topo_sort_images(
 fn image_content_hash(
     format: &str,
     staging_hash: &str,
+    metadata_hash: &str,
     min_size_mib: Option<u64>,
     size_mib: Option<u64>,
 ) -> String {
     let mut hasher = Sha256::new();
     hasher.update(format!("format={format}\n").as_bytes());
     hasher.update(format!("staging={staging_hash}\n").as_bytes());
-    // Keep existing image hashes unchanged when no minimum was requested.
+    hasher.update(format!("metadata={metadata_hash}\n").as_bytes());
+    // Size constraints participate only when explicitly selected. Composed
+    // metadata is always hashed because it changes the sealed filesystem.
     if let Some(size) = min_size_mib {
         hasher.update(format!("min-size-mib={size}\n").as_bytes());
     }
@@ -3399,6 +3422,7 @@ fn gpt_partition_type(type_name: &str) -> Result<gpt::partition_types::Type, Str
 
 fn build_gpt_ext2_from_staging(
     staging_dir: &Path,
+    metadata: &CompositionMetadata,
     output_path: &Path,
     section_name: &str,
     min_size_mib: Option<u64>,
@@ -3427,6 +3451,7 @@ fn build_gpt_ext2_from_staging(
         let partition_image = work_dir.join("rootfs.ext2");
         build_ext2_from_staging(
             staging_dir,
+            metadata,
             &partition_image,
             section_name,
             min_size_mib,
@@ -3559,6 +3584,7 @@ fn ext2_size_kib(
 
 fn build_ext2_from_staging(
     staging_dir: &Path,
+    metadata: &CompositionMetadata,
     output_path: &Path,
     section_name: &str,
     min_size_mib: Option<u64>,
@@ -3573,8 +3599,10 @@ fn build_ext2_from_staging(
         .split_whitespace()
         .next()
         .unwrap_or("0")
-        .parse()
-        .unwrap_or(0);
+        .parse::<u64>()
+        .unwrap_or(0)
+        .checked_add(metadata.ext2_overhead_kib())
+        .ok_or("ext2 metadata size overflow")?;
     let size_kb = ext2_size_kib(source_kb, min_size_mib, size_mib)?;
 
     if let Some(parent) = output_path.parent() {
@@ -3620,6 +3648,7 @@ fn build_ext2_from_staging(
     if !mke2fs_status.success() {
         return Err("mke2fs failed".to_string());
     }
+    apply_ext2_metadata(output_path, metadata)?;
 
     eprintln!(
         "cargo-scarlet: wrote {} to {} ({}KB, source={}KB)",
@@ -3638,6 +3667,35 @@ fn file_size(path: &Path) -> Result<u64, String> {
 }
 
 fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
+    copy_dir_recursive_inner(src, dst, &mut BTreeMap::new())
+}
+
+fn copy_composed_tree(
+    source: &Path,
+    destination: &Path,
+    staging_root: &Path,
+    source_metadata: Option<&CompositionMetadata>,
+    metadata: &mut CompositionMetadata,
+) -> Result<(), String> {
+    let relative = destination
+        .strip_prefix(staging_root)
+        .map_err(|_| "image layer destination is outside staging root".to_string())?;
+    copy_dir_recursive(source, destination)?;
+    // Generated application files may have no explicit source record. Clear
+    // metadata of every replaced node before restoring the source's records.
+    metadata.ensure_parent_directories(relative);
+    metadata.capture_tree(source, relative)?;
+    if let Some(source_metadata) = source_metadata {
+        metadata.overlay_tree(source_metadata, relative)?;
+    }
+    Ok(())
+}
+
+fn copy_dir_recursive_inner(
+    src: &Path,
+    dst: &Path,
+    hardlinks: &mut BTreeMap<(u64, u64), PathBuf>,
+) -> Result<(), String> {
     fs::create_dir_all(dst).map_err(|e| format!("failed to create {}: {e}", dst.display()))?;
     for entry in
         fs::read_dir(src).map_err(|e| format!("failed to read_dir {}: {e}", src.display()))?
@@ -3657,8 +3715,30 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
                 )
             })?;
         } else if src_path.is_dir() {
-            copy_dir_recursive(&src_path, &dst_path)?;
+            copy_dir_recursive_inner(&src_path, &dst_path, hardlinks)?;
         } else {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                let metadata = fs::metadata(&src_path)
+                    .map_err(|e| format!("failed to stat {}: {e}", src_path.display()))?;
+                if metadata.nlink() > 1 {
+                    let key = (metadata.dev(), metadata.ino());
+                    if let Some(first) = hardlinks.get(&key) {
+                        remove_existing_path(&dst_path)?;
+                        fs::hard_link(first, &dst_path).map_err(|e| {
+                            format!(
+                                "failed to preserve hardlink {} -> {}: {e}",
+                                src_path.display(),
+                                first.display()
+                            )
+                        })?;
+                        continue;
+                    }
+                    hardlinks.insert(key, dst_path.clone());
+                }
+            }
+            remove_existing_path(&dst_path)?;
             fs::copy(&src_path, &dst_path).map_err(|e| {
                 format!(
                     "failed to copy {} -> {}: {e}",
@@ -3934,11 +4014,126 @@ fn archive_symlink_target_path(
     }
 }
 
+fn archive_node_metadata<R: Read>(entry: &mut tar::Entry<'_, R>) -> Result<NodeMetadata, String> {
+    let entry_type = entry.header().entry_type();
+    let file_type = if entry_type.is_dir() {
+        0o040000
+    } else if entry_type.is_symlink() {
+        0o120000
+    } else {
+        0o100000
+    };
+    let uid = u32::try_from(
+        entry
+            .header()
+            .uid()
+            .map_err(|error| format!("failed to read archive uid: {error}"))?,
+    )
+    .map_err(|_| "archive uid exceeds ext2's 32-bit range".to_string())?;
+    let gid = u32::try_from(
+        entry
+            .header()
+            .gid()
+            .map_err(|error| format!("failed to read archive gid: {error}"))?,
+    )
+    .map_err(|_| "archive gid exceeds ext2's 32-bit range".to_string())?;
+    let mode = file_type
+        | (entry
+            .header()
+            .mode()
+            .map_err(|error| format!("failed to read archive mode: {error}"))?
+            & 0o7777);
+    let mut mtime_sec = i64::try_from(
+        entry
+            .header()
+            .mtime()
+            .map_err(|error| format!("failed to read archive mtime: {error}"))?,
+    )
+    .map_err(|_| "archive mtime exceeds the supported range".to_string())?;
+    let mut mtime_nsec = 0;
+    let mut xattrs = BTreeMap::new();
+    if let Some(extensions) = entry
+        .pax_extensions()
+        .map_err(|error| format!("failed to read archive PAX headers: {error}"))?
+    {
+        for extension in extensions {
+            let extension = extension
+                .map_err(|error| format!("failed to parse archive PAX header: {error}"))?;
+            let key = extension
+                .key()
+                .map_err(|_| "archive PAX key is not UTF-8".to_string())?;
+            if key == "mtime" {
+                (mtime_sec, mtime_nsec) = parse_pax_mtime(extension.value_bytes())?;
+            } else if let Some(name) = key.strip_prefix("SCHILY.xattr.") {
+                if name.is_empty() || name.contains(['\0', '\n', '\r']) {
+                    return Err("archive PAX xattr has an invalid name".to_string());
+                }
+                xattrs.insert(name.to_string(), extension.value_bytes().to_vec());
+            }
+        }
+    }
+    Ok(NodeMetadata {
+        uid,
+        gid,
+        mode,
+        mtime_sec,
+        mtime_nsec,
+        xattrs,
+    })
+}
+
+fn parse_pax_mtime(value: &[u8]) -> Result<(i64, u32), String> {
+    let text = core::str::from_utf8(value)
+        .map_err(|_| "archive PAX mtime is not valid decimal text".to_string())?;
+    let (negative, magnitude) = if let Some(value) = text.strip_prefix('-') {
+        (true, value)
+    } else {
+        (false, text.strip_prefix('+').unwrap_or(text))
+    };
+    let (whole, fraction) = magnitude.split_once('.').unwrap_or((magnitude, ""));
+    if whole.is_empty() || !whole.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(format!("invalid archive PAX mtime {text:?}"));
+    }
+    if fraction.len() > 9 || !fraction.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(format!("archive PAX mtime {text:?} has invalid precision"));
+    }
+    let whole: i64 = whole
+        .parse()
+        .map_err(|_| format!("archive PAX mtime {text:?} is out of range"))?;
+    let nanos = if fraction.is_empty() {
+        0u32
+    } else {
+        format!("{fraction:0<9}")
+            .parse::<u32>()
+            .map_err(|_| format!("invalid archive PAX mtime {text:?}"))?
+    };
+    if negative && nanos != 0 {
+        let seconds = whole
+            .checked_neg()
+            .and_then(|value| value.checked_sub(1))
+            .ok_or_else(|| format!("archive PAX mtime {text:?} is out of range"))?;
+        Ok((seconds, 1_000_000_000 - nanos))
+    } else if negative && whole == i64::MIN {
+        Err(format!("archive PAX mtime {text:?} is out of range"))
+    } else {
+        Ok((if negative { -whole } else { whole }, nanos))
+    }
+}
+
 fn extract_archive_entries<R: Read>(
     archive: &mut tar::Archive<R>,
     strip_components: usize,
     dest_root: &Path,
+    staging_root: &Path,
+    metadata: &mut CompositionMetadata,
 ) -> Result<(), String> {
+    let destination_prefix = dest_root.strip_prefix(staging_root).map_err(|_| {
+        format!(
+            "archive destination {} is outside staging root {}",
+            dest_root.display(),
+            staging_root.display()
+        )
+    })?;
     let mut directory_modes = BTreeMap::new();
     for entry in archive
         .entries()
@@ -3952,9 +4147,26 @@ fn extract_archive_entries<R: Read>(
         if entry.path_bytes().starts_with(b"/") {
             return Err(format!("refusing absolute archive path {}", path.display()));
         }
-        let Some(relative) = archive_entry_relative_path(&path, strip_components)? else {
+        let relative = archive_entry_relative_path(&path, strip_components)?;
+        let metadata_path = relative.as_deref().map_or_else(
+            || destination_prefix.to_path_buf(),
+            |relative| destination_prefix.join(relative),
+        );
+        let Some(relative) = relative else {
+            if entry.header().entry_type().is_dir()
+                && path
+                    .components()
+                    .filter(|component| matches!(component, Component::Normal(_)))
+                    .count()
+                    == strip_components
+            {
+                metadata.ensure_parent_directories(&metadata_path);
+                metadata.set_entry(metadata_path, archive_node_metadata(&mut entry)?)?;
+            }
             continue;
         };
+        metadata.ensure_parent_directories(&metadata_path);
+        let node_metadata = archive_node_metadata(&mut entry)?;
         let dest = dest_root.join(relative);
         if !dest.starts_with(dest_root) || !lexical_contains(dest_root, &dest) {
             return Err(format!(
@@ -4015,9 +4227,9 @@ fn extract_archive_entries<R: Read>(
                 .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
             ensure_no_symlink_ancestors(dest_root, &dest)?;
             remove_existing_path(&dest)?;
-            fs::copy(&target_dest, &dest).map_err(|error| {
+            fs::hard_link(&target_dest, &dest).map_err(|error| {
                 format!(
-                    "failed to materialize hardlink {} -> {}: {error}",
+                    "failed to create hardlink {} -> {}: {error}",
                     path.display(),
                     target.display()
                 )
@@ -4033,6 +4245,7 @@ fn extract_archive_entries<R: Read>(
                         dest.display()
                     )
                 })?;
+            metadata.set_entry(metadata_path, node_metadata)?;
             continue;
         }
         if !entry_type.is_file() && !entry_type.is_dir() && !entry_type.is_symlink() {
@@ -4066,6 +4279,7 @@ fn extract_archive_entries<R: Read>(
                 .map_err(|error| {
                     format!("failed to set permissions on {}: {error}", dest.display())
                 })?;
+            metadata.set_entry(metadata_path, node_metadata)?;
         } else if entry_type.is_dir() {
             ensure_no_symlink_ancestors(dest_root, &dest)?;
             fs::create_dir_all(&dest)
@@ -4083,6 +4297,7 @@ fn extract_archive_entries<R: Read>(
             )
             .map_err(|error| format!("failed to set permissions on {}: {error}", dest.display()))?;
             directory_modes.insert(dest, mode);
+            metadata.set_entry(metadata_path, node_metadata)?;
         } else {
             let target = entry
                 .link_name()
@@ -4116,6 +4331,7 @@ fn extract_archive_entries<R: Read>(
                     target.display()
                 )
             })?;
+            metadata.set_entry(metadata_path, node_metadata)?;
         }
     }
     // Restrict children before their parents, so a parent without search
@@ -4129,11 +4345,30 @@ fn extract_archive_entries<R: Read>(
     Ok(())
 }
 
+#[cfg(test)]
 fn extract_archive_safe(
     archive_path: &Path,
     format: ArchiveFormat,
     strip_components: usize,
     dest_root: &Path,
+) -> Result<(), String> {
+    extract_archive_safe_with_metadata(
+        archive_path,
+        format,
+        strip_components,
+        dest_root,
+        dest_root,
+        &mut CompositionMetadata::default(),
+    )
+}
+
+fn extract_archive_safe_with_metadata(
+    archive_path: &Path,
+    format: ArchiveFormat,
+    strip_components: usize,
+    dest_root: &Path,
+    staging_root: &Path,
+    metadata: &mut CompositionMetadata,
 ) -> Result<(), String> {
     let dest_root = if dest_root.is_absolute() {
         dest_root.to_path_buf()
@@ -4151,23 +4386,47 @@ fn extract_archive_safe(
     match format {
         ArchiveFormat::Tar => {
             let mut archive = tar::Archive::new(file);
-            extract_archive_entries(&mut archive, strip_components, &dest_root)
+            extract_archive_entries(
+                &mut archive,
+                strip_components,
+                &dest_root,
+                staging_root,
+                metadata,
+            )
         }
         ArchiveFormat::TarGz => {
             let decoder = flate2::read::GzDecoder::new(file);
             let mut archive = tar::Archive::new(decoder);
-            extract_archive_entries(&mut archive, strip_components, &dest_root)
+            extract_archive_entries(
+                &mut archive,
+                strip_components,
+                &dest_root,
+                staging_root,
+                metadata,
+            )
         }
         ArchiveFormat::TarZst => {
             let decoder = zstd::stream::Decoder::new(file)
                 .map_err(|error| format!("failed to open zstd archive: {error}"))?;
             let mut archive = tar::Archive::new(decoder);
-            extract_archive_entries(&mut archive, strip_components, &dest_root)
+            extract_archive_entries(
+                &mut archive,
+                strip_components,
+                &dest_root,
+                staging_root,
+                metadata,
+            )
         }
         ArchiveFormat::TarXz => {
             let decoder = xz2::read::XzDecoder::new(file);
             let mut archive = tar::Archive::new(decoder);
-            extract_archive_entries(&mut archive, strip_components, &dest_root)
+            extract_archive_entries(
+                &mut archive,
+                strip_components,
+                &dest_root,
+                staging_root,
+                metadata,
+            )
         }
     }
 }
@@ -4185,14 +4444,17 @@ fn apply_archive_layer(
     staging_dir: &Path,
     cache_dir: &Path,
     layer_locks: &mut Vec<LayerLock>,
+    metadata: &mut CompositionMetadata,
 ) -> Result<(), String> {
     let archive_path = fetch_archive_by_sha256(&archive.url, &archive.sha256, cache_dir)?;
     let dest_root = archive_destination(staging_dir, &archive.to)?;
-    extract_archive_safe(
+    extract_archive_safe_with_metadata(
         &archive_path,
         archive.format.clone(),
         archive.strip_components,
         &dest_root,
+        staging_dir,
+        metadata,
     )?;
     layer_locks.push(LayerLock::Archive {
         source: LockPackageSource::archive(archive.url.clone(), archive.sha256.clone()),
@@ -4211,6 +4473,7 @@ fn apply_copy_layer(
     prev_section_lock: Option<&SectionLock>,
     tpl_ctx: &TemplateContext,
     layer_locks: &mut Vec<LayerLock>,
+    metadata: &mut CompositionMetadata,
 ) -> Result<(), String> {
     let local_path = match &file.source {
         FileSource::Local(p) => p.clone(),
@@ -4232,16 +4495,21 @@ fn apply_copy_layer(
     };
 
     let dest = staging_dir.join(file.to.trim_start_matches('/'));
+    let destination_relative = Path::new(file.to.trim_start_matches('/'));
+    metadata.ensure_parent_directories(destination_relative);
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)
             .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
     }
     if local_path.is_dir() {
         copy_dir_recursive(&local_path, &dest)?;
+        metadata.capture_tree(&local_path, destination_relative)?;
     } else if file.template {
+        metadata.invalidate(destination_relative);
         let content = fs::read_to_string(&local_path)
             .map_err(|e| format!("failed to read template {}: {e}", local_path.display()))?;
         let expanded = tpl_ctx.expand(&content);
+        remove_existing_path(&dest)?;
         fs::write(&dest, expanded).map_err(|e| {
             format!(
                 "failed to write template {} -> {}: {e}",
@@ -4249,8 +4517,11 @@ fn apply_copy_layer(
                 dest.display()
             )
         })?;
+        metadata.capture_node(&local_path, destination_relative)?;
     } else {
+        metadata.invalidate(destination_relative);
         copy_path_or_dir(&local_path, &dest)?;
+        metadata.capture_node(&local_path, destination_relative)?;
     }
 
     Ok(())
@@ -4325,6 +4596,7 @@ fn copy_path_or_dir(source: &Path, dest: &Path) -> Result<(), String> {
             fs::create_dir_all(parent)
                 .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
         }
+        remove_existing_path(dest)?;
         fs::copy(source, dest).map_err(|e| {
             format!(
                 "failed to copy {} -> {}: {e}",
@@ -4403,7 +4675,29 @@ fn install_package(
     profile: &str,
     prev_lock: Option<&PackageLock>,
 ) -> Result<Option<PackageLock>, String> {
+    install_package_with_metadata(
+        staging_dir,
+        pkg,
+        project,
+        target_triple,
+        profile,
+        prev_lock,
+        &mut CompositionMetadata::default(),
+    )
+}
+
+fn install_package_with_metadata(
+    staging_dir: &Path,
+    pkg: &ResolvedPackage,
+    project: &Path,
+    target_triple: &str,
+    profile: &str,
+    prev_lock: Option<&PackageLock>,
+    metadata: &mut CompositionMetadata,
+) -> Result<Option<PackageLock>, String> {
     let dest = staging_dir.join(pkg.to.trim_start_matches('/'));
+    let destination_relative = Path::new(pkg.to.trim_start_matches('/'));
+    metadata.ensure_parent_directories(destination_relative);
 
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)
@@ -4491,8 +4785,11 @@ fn install_package(
                 }
                 built
             };
+            metadata.invalidate(destination_relative);
+            remove_existing_path(&dest)?;
             fs::copy(&binary, &dest)
                 .map_err(|e| format!("failed to copy {}: {e}", binary.display()))?;
+            metadata.capture_node(&binary, destination_relative)?;
 
             let hash = sha256_file(&binary)?;
             let (source, git_url, resolved_rev) = match &pkg.source {
@@ -4602,11 +4899,14 @@ fn install_package(
             if !copy_dest.as_os_str().is_empty() {
                 if script_output.is_dir() {
                     copy_dir_recursive(&script_output, &copy_dest)?;
+                    metadata.capture_tree(&script_output, destination_relative)?;
                 } else if script_output.exists() {
                     if let Some(parent) = copy_dest.parent() {
                         fs::create_dir_all(parent)
                             .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
                     }
+                    metadata.invalidate(destination_relative);
+                    remove_existing_path(&copy_dest)?;
                     fs::copy(&script_output, &copy_dest).map_err(|e| {
                         format!(
                             "failed to copy {} -> {}: {e}",
@@ -4614,7 +4914,11 @@ fn install_package(
                             copy_dest.display()
                         )
                     })?;
+                    metadata.capture_node(&script_output, destination_relative)?;
                 }
+            }
+            if copy_dest.as_os_str().is_empty() && dest.exists() {
+                metadata.capture_node(&dest, destination_relative)?;
             }
 
             let hash = if script_output.is_dir() {
@@ -4650,9 +4954,13 @@ fn install_package(
             })?;
             if from.is_dir() {
                 copy_dir_contents(from, &dest, &[])?;
+                metadata.capture_tree(from, destination_relative)?;
             } else if from.exists() {
+                metadata.invalidate(destination_relative);
+                remove_existing_path(&dest)?;
                 fs::copy(from, &dest)
                     .map_err(|e| format!("failed to copy {}: {e}", from.display()))?;
+                metadata.capture_node(from, destination_relative)?;
             } else {
                 eprintln!(
                     "cargo-scarlet: warning: source not found: {}",
@@ -5012,6 +5320,7 @@ fn copy_dir_contents(
                 fs::create_dir_all(parent)
                     .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
             }
+            remove_existing_path(&destination_path)?;
             fs::copy(&source_path, &destination_path).map_err(|error| {
                 format!(
                     "failed to copy {} to {}: {error}",
@@ -6881,7 +7190,16 @@ to = "/system/scarlet/bin/video_player"
         };
         let mut layer_locks = Vec::new();
 
-        apply_copy_layer(&file, &staging, &cache, None, &tpl_ctx, &mut layer_locks).unwrap();
+        apply_copy_layer(
+            &file,
+            &staging,
+            &cache,
+            None,
+            &tpl_ctx,
+            &mut layer_locks,
+            &mut CompositionMetadata::default(),
+        )
+        .unwrap();
 
         assert!(staging.join("data/config/system/linux-aarch64").is_dir());
         let _ = fs::remove_dir_all(&temp);
@@ -6976,29 +7294,33 @@ to = "/system/scarlet/bin/video_player"
     }
 
     #[test]
-    fn image_minimum_size_invalidates_cache_without_changing_legacy_hashes() {
+    fn image_size_and_metadata_invalidate_cache() {
         let mut legacy = Sha256::new();
-        legacy.update(b"format=ext2\nstaging=unchanged\n");
+        legacy.update(b"format=ext2\nstaging=unchanged\nmetadata=metadata-a\n");
         assert_eq!(
-            image_content_hash("ext2", "unchanged", None, None),
+            image_content_hash("ext2", "unchanged", "metadata-a", None, None),
             format!("sha256:{}", hex::encode(legacy.finalize()))
+        );
+        assert_ne!(
+            image_content_hash("ext2", "unchanged", "metadata-a", None, None),
+            image_content_hash("ext2", "unchanged", "metadata-b", None, None)
         );
         for format in ["ext2", "gpt-ext2"] {
             assert_ne!(
-                image_content_hash(format, "unchanged", Some(8192), None),
-                image_content_hash(format, "unchanged", None, Some(8192))
+                image_content_hash(format, "unchanged", "metadata-a", Some(8192), None),
+                image_content_hash(format, "unchanged", "metadata-a", None, Some(8192))
             );
             assert_ne!(
-                image_content_hash(format, "unchanged", None, Some(4096)),
-                image_content_hash(format, "unchanged", None, Some(8192))
+                image_content_hash(format, "unchanged", "metadata-a", None, Some(4096)),
+                image_content_hash(format, "unchanged", "metadata-a", None, Some(8192))
             );
             assert_ne!(
-                image_content_hash(format, "unchanged", None, None),
-                image_content_hash(format, "unchanged", Some(8192), None)
+                image_content_hash(format, "unchanged", "metadata-a", None, None),
+                image_content_hash(format, "unchanged", "metadata-a", Some(8192), None)
             );
             assert_ne!(
-                image_content_hash(format, "unchanged", Some(4096), None),
-                image_content_hash(format, "unchanged", Some(8192), None)
+                image_content_hash(format, "unchanged", "metadata-a", Some(4096), None),
+                image_content_hash(format, "unchanged", "metadata-a", Some(8192), None)
             );
         }
     }
@@ -7018,7 +7340,15 @@ to = "/system/scarlet/bin/video_player"
         fs::create_dir_all(staging.join("etc")).unwrap();
         fs::write(staging.join("etc/issue"), "Scarlet\n").unwrap();
         let output = temp.join("rootfs.ext2");
-        build_ext2_from_staging(&staging, &output, "rootfs", None, Some(65)).unwrap();
+        build_ext2_from_staging(
+            &staging,
+            &CompositionMetadata::default(),
+            &output,
+            "rootfs",
+            None,
+            Some(65),
+        )
+        .unwrap();
         let mut file = fs::File::open(&output).unwrap();
         assert_eq!(file.metadata().unwrap().len(), 65 * 1024 * 1024);
         file.seek(SeekFrom::Start(1024)).unwrap();
@@ -7028,6 +7358,90 @@ to = "/system/scarlet/bin/video_player"
         let block_size = 1024u64 << u32::from_le_bytes(superblock[24..28].try_into().unwrap());
         assert_eq!(blocks * block_size, 65 * 1024 * 1024);
         let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn ext2_metadata_preserves_owners_2038_mtime_special_mode_and_binary_xattrs() {
+        if !command_exists("mke2fs") || !command_exists("debugfs") {
+            eprintln!("skipping ext2 metadata test: mke2fs/debugfs not found");
+            return;
+        }
+        let temp = archive_test_dir("ext2-metadata");
+        let staging = temp.join("staging");
+        fs::create_dir_all(staging.join("etc")).unwrap();
+        fs::write(staging.join("etc/failed"), b"x").unwrap();
+        let capability = vec![0, 0, 0, 2, 0x20, 0, 0, 0, 0xff];
+        let mut metadata = CompositionMetadata::default();
+        metadata
+            .set_entry(
+                PathBuf::from("etc/failed"),
+                NodeMetadata {
+                    uid: 1234,
+                    gid: 2345,
+                    mode: 0o104755,
+                    mtime_sec: 2_147_483_648,
+                    mtime_nsec: 250_000_000,
+                    xattrs: BTreeMap::from([
+                        ("security.capability".to_string(), capability.clone()),
+                        ("user.scarlet".to_string(), vec![0, 0xff, 7]),
+                    ]),
+                },
+            )
+            .unwrap();
+        let output = temp.join("rootfs.ext2");
+        build_ext2_from_staging(&staging, &metadata, &output, "rootfs", Some(16), None).unwrap();
+
+        let stat = Command::new("debugfs")
+            .args(["-R", "stat \"/etc/failed\"", output.to_str().unwrap()])
+            .output()
+            .unwrap();
+        let stat_text = String::from_utf8_lossy(&stat.stdout);
+        assert!(stat.status.success(), "{stat_text}");
+        assert!(stat_text.contains("User:  1234"), "{stat_text}");
+        assert!(stat_text.contains("Group:  2345"), "{stat_text}");
+        let mode = stat_text
+            .lines()
+            .find_map(|line| line.split_once("Mode:").map(|(_, value)| value))
+            .and_then(|value| value.split_whitespace().next())
+            .and_then(|value| u32::from_str_radix(value, 8).ok())
+            .expect("ext2 mode");
+        assert_eq!(mode, 0o4755);
+        assert!(
+            stat_text.contains("mtime: 0x80000000:3b9aca01"),
+            "{stat_text}"
+        );
+
+        for (name, expected) in [
+            ("security.capability", capability.as_slice()),
+            ("user.scarlet", &[0, 0xff, 7][..]),
+        ] {
+            let value = temp.join(format!("{name}.xattr"));
+            let dump = Command::new("debugfs")
+                .args([
+                    "-R",
+                    &format!(
+                        "ea_get -f \"{}\" \"/etc/failed\" \"{name}\"",
+                        value.display()
+                    ),
+                    output.to_str().unwrap(),
+                ])
+                .output()
+                .unwrap();
+            assert!(dump.status.success());
+            assert_eq!(fs::read(value).unwrap(), expected, "{name}");
+        }
+
+        let mut missing = CompositionMetadata::default();
+        missing
+            .set_entry(
+                PathBuf::from("etc/missing"),
+                NodeMetadata::directory(1, 2, 0o755),
+            )
+            .unwrap();
+        let error = apply_ext2_metadata(&output, &missing)
+            .expect_err("debugfs lookup errors must not be ignored");
+        assert!(error.contains("File not found"), "{error}");
+        fs::remove_dir_all(&temp).unwrap();
     }
 
     #[test]
@@ -7047,7 +7461,15 @@ to = "/system/scarlet/bin/video_player"
         fs::write(staging.join("etc/issue"), "Scarlet\n").unwrap();
         let output = temp.join("rootfs.img");
 
-        build_gpt_ext2_from_staging(&staging, &output, "rootfs", Some(128), None).unwrap();
+        build_gpt_ext2_from_staging(
+            &staging,
+            &CompositionMetadata::default(),
+            &output,
+            "rootfs",
+            Some(128),
+            None,
+        )
+        .unwrap();
 
         let disk = gpt::GptConfig::new().open(&output).unwrap();
         let partition = disk.partitions().get(&1).expect("missing partition 1");
@@ -7464,11 +7886,84 @@ to = "/"
             let mut header = tar::Header::new_gnu();
             header.set_size(content.len() as u64);
             header.set_mode(0o644);
+            header.set_uid(0);
+            header.set_gid(0);
+            header.set_mtime(0);
             header.set_cksum();
             builder
                 .append_data(&mut header, path, Cursor::new(content.to_vec()))
                 .unwrap();
         }
+        builder.finish().unwrap();
+        builder.into_inner().unwrap()
+    }
+
+    fn tar_with_metadata() -> Vec<u8> {
+        use std::io::Cursor;
+
+        let mut builder = tar::Builder::new(Vec::new());
+        builder
+            .append_pax_extensions([
+                ("uid", b"501".as_slice()),
+                ("gid", b"502".as_slice()),
+                ("hdrcharset", b"BINARY".as_slice()),
+                (
+                    "SCHILY.xattr.security.selinux",
+                    b"u:object_r:system_file:s0".as_slice(),
+                ),
+            ])
+            .unwrap();
+        let mut root = tar::Header::new_gnu();
+        root.set_entry_type(tar::EntryType::dir());
+        root.set_size(0);
+        root.set_mode(0o750);
+        root.set_uid(0);
+        root.set_gid(0);
+        root.set_mtime(0);
+        root.set_cksum();
+        builder
+            .append_data(&mut root, "pkg/", Cursor::new(Vec::<u8>::new()))
+            .unwrap();
+
+        let capability = [0, 0, 0, 2, 0x20, 0, 0, 0, 0xff];
+        builder
+            .append_pax_extensions([
+                ("uid", b"1234".as_slice()),
+                ("gid", b"2345".as_slice()),
+                ("mtime", b"1.25".as_slice()),
+                ("hdrcharset", b"BINARY".as_slice()),
+                ("SCHILY.xattr.security.capability", capability.as_slice()),
+            ])
+            .unwrap();
+        let mut file = tar::Header::new_gnu();
+        file.set_size(3);
+        file.set_mode(0o4755);
+        file.set_uid(0);
+        file.set_gid(0);
+        file.set_mtime(0);
+        file.set_cksum();
+        builder
+            .append_data(&mut file, "pkg/etc/cap", Cursor::new(b"cap"))
+            .unwrap();
+
+        builder
+            .append_pax_extensions([
+                ("hdrcharset", b"BINARY".as_slice()),
+                ("SCHILY.xattr.security.capability", capability.as_slice()),
+            ])
+            .unwrap();
+        let mut link = tar::Header::new_gnu();
+        link.set_entry_type(tar::EntryType::hard_link());
+        link.set_size(0);
+        link.set_mode(0o4755);
+        link.set_uid(0);
+        link.set_gid(0);
+        link.set_mtime(0);
+        link.set_link_name("pkg/etc/cap").unwrap();
+        link.set_cksum();
+        builder
+            .append_data(&mut link, "pkg/etc/cap-link", Cursor::new(Vec::<u8>::new()))
+            .unwrap();
         builder.finish().unwrap();
         builder.into_inner().unwrap()
     }
@@ -7506,6 +8001,9 @@ to = "/"
         header.set_entry_type(entry_type);
         header.set_size(0);
         header.set_mode(0o777);
+        header.set_uid(0);
+        header.set_gid(0);
+        header.set_mtime(0);
         header.set_link_name(target).unwrap();
         header.set_cksum();
         builder
@@ -7801,6 +8299,9 @@ to = "/system"
         directory.set_entry_type(tar::EntryType::dir());
         directory.set_size(0);
         directory.set_mode(0o555);
+        directory.set_uid(0);
+        directory.set_gid(0);
+        directory.set_mtime(0);
         directory.set_cksum();
         builder
             .append_data(&mut directory, "licenses", std::io::empty())
@@ -7808,6 +8309,9 @@ to = "/system"
         let mut file = tar::Header::new_gnu();
         file.set_size(7);
         file.set_mode(0o444);
+        file.set_uid(0);
+        file.set_gid(0);
+        file.set_mtime(0);
         file.set_cksum();
         builder
             .append_data(&mut file, "licenses/LICENSE.TXT", &b"license"[..])
@@ -7851,6 +8355,9 @@ to = "/system"
         let mut target_header = tar::Header::new_gnu();
         target_header.set_size(3);
         target_header.set_mode(0o644);
+        target_header.set_uid(0);
+        target_header.set_gid(0);
+        target_header.set_mtime(0);
         target_header.set_cksum();
         builder
             .append_data(
@@ -7864,6 +8371,9 @@ to = "/system"
         link_header.set_entry_type(tar::EntryType::hard_link());
         link_header.set_size(0);
         link_header.set_mode(0o644);
+        link_header.set_uid(0);
+        link_header.set_gid(0);
+        link_header.set_mtime(0);
         link_header.set_link_name("root/kms_swrast_dri.so").unwrap();
         link_header.set_cksum();
         builder
@@ -7886,6 +8396,16 @@ to = "/system"
                 .file_type()
                 .is_file()
         );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let original = fs::metadata(dest.join("kms_swrast_dri.so")).unwrap();
+            let linked = fs::metadata(dest.join("swrast_dri.so")).unwrap();
+            assert_eq!(
+                (original.dev(), original.ino()),
+                (linked.dev(), linked.ino())
+            );
+        }
         fs::remove_dir_all(&temp).unwrap();
     }
 
@@ -7911,6 +8431,345 @@ to = "/system"
         extract_archive_safe(&archive, ArchiveFormat::Tar, 1, &dest).unwrap();
         assert_eq!(fs::read(dest.join("foo.txt")).unwrap(), b"foo");
         assert_eq!(fs::read(dest.join("sub/bar.txt")).unwrap(), b"bar");
+        fs::remove_dir_all(&temp).unwrap();
+    }
+
+    #[test]
+    fn archive_metadata_rebases_root_and_preserves_binary_pax_values() {
+        let temp = archive_test_dir("archive-metadata");
+        let archive = write_archive_fixture(&temp, "metadata.tar", &tar_with_metadata());
+        let staging = temp.join("staging");
+        let destination = staging.join("systems/android-aarch64");
+        let mut metadata = CompositionMetadata::default();
+        extract_archive_safe_with_metadata(
+            &archive,
+            ArchiveFormat::Tar,
+            1,
+            &destination,
+            &staging,
+            &mut metadata,
+        )
+        .unwrap();
+
+        let root = metadata
+            .get(Path::new("systems/android-aarch64"))
+            .expect("stripped root metadata");
+        assert_eq!((root.uid, root.gid, root.mode), (501, 502, 0o040750));
+        assert_eq!(
+            root.xattrs.get("security.selinux"),
+            Some(&b"u:object_r:system_file:s0".to_vec())
+        );
+
+        let file = metadata
+            .get(Path::new("systems/android-aarch64/etc/cap"))
+            .expect("file metadata");
+        assert_eq!((file.uid, file.gid, file.mode), (1234, 2345, 0o104755));
+        assert_eq!((file.mtime_sec, file.mtime_nsec), (1, 250_000_000));
+        assert_eq!(
+            file.xattrs.get("security.capability"),
+            Some(&vec![0, 0, 0, 2, 0x20, 0, 0, 0, 0xff])
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let original = fs::metadata(destination.join("etc/cap")).unwrap();
+            let linked = fs::metadata(destination.join("etc/cap-link")).unwrap();
+            assert_eq!(
+                (original.dev(), original.ino()),
+                (linked.dev(), linked.ino())
+            );
+        }
+        fs::remove_dir_all(&temp).unwrap();
+    }
+
+    #[test]
+    fn stripped_regular_file_does_not_replace_archive_root_directory_metadata() {
+        use std::io::Cursor;
+
+        let temp = archive_test_dir("archive-stripped-file-metadata");
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut root = tar::Header::new_gnu();
+        root.set_entry_type(tar::EntryType::dir());
+        root.set_size(0);
+        root.set_mode(0o750);
+        root.set_uid(501);
+        root.set_gid(502);
+        root.set_mtime(0);
+        root.set_cksum();
+        builder
+            .append_data(&mut root, "pkg/", Cursor::new(Vec::<u8>::new()))
+            .unwrap();
+        let mut stray = tar::Header::new_gnu();
+        stray.set_size(5);
+        stray.set_mode(0o600);
+        stray.set_uid(999);
+        stray.set_gid(999);
+        stray.set_mtime(0);
+        stray.set_cksum();
+        builder
+            .append_data(&mut stray, "stray", Cursor::new(b"stray"))
+            .unwrap();
+        builder.finish().unwrap();
+        let archive = write_archive_fixture(&temp, "archive.tar", &builder.into_inner().unwrap());
+        let staging = temp.join("staging");
+        let destination = staging.join("root");
+        let mut metadata = CompositionMetadata::default();
+        extract_archive_safe_with_metadata(
+            &archive,
+            ArchiveFormat::Tar,
+            1,
+            &destination,
+            &staging,
+            &mut metadata,
+        )
+        .unwrap();
+        let root = metadata.get(Path::new("root")).expect("root metadata");
+        assert_eq!((root.uid, root.gid, root.mode), (501, 502, 0o040750));
+        assert!(!destination.join("stray").exists());
+        fs::remove_dir_all(&temp).unwrap();
+    }
+
+    #[test]
+    fn pax_mtime_parser_is_exact_for_positive_and_negative_fractions() {
+        assert_eq!(parse_pax_mtime(b"1.25").unwrap(), (1, 250_000_000));
+        assert_eq!(parse_pax_mtime(b"-1.25").unwrap(), (-2, 750_000_000));
+        assert_eq!(parse_pax_mtime(b"0.000000001").unwrap(), (0, 1));
+        assert_eq!(parse_pax_mtime(b"-1.000").unwrap(), (-1, 0));
+        assert!(parse_pax_mtime(b"1.0000000001").is_err());
+    }
+
+    #[test]
+    fn later_archive_entry_replaces_metadata_and_clears_old_capabilities() {
+        let temp = archive_test_dir("archive-metadata-overlay");
+        let staging = temp.join("staging");
+        let destination = staging.join("root");
+        let mut metadata = CompositionMetadata::default();
+        let first = write_archive_fixture(&temp, "first.tar", &tar_with_metadata());
+        extract_archive_safe_with_metadata(
+            &first,
+            ArchiveFormat::Tar,
+            1,
+            &destination,
+            &staging,
+            &mut metadata,
+        )
+        .unwrap();
+        let replacement = write_archive_fixture(
+            &temp,
+            "replacement.tar",
+            &tar_bytes(&[("pkg/etc/cap", b"replacement")]),
+        );
+        extract_archive_safe_with_metadata(
+            &replacement,
+            ArchiveFormat::Tar,
+            1,
+            &destination,
+            &staging,
+            &mut metadata,
+        )
+        .unwrap();
+        let file = metadata
+            .get(Path::new("root/etc/cap"))
+            .expect("replacement metadata");
+        assert!(!file.xattrs.contains_key("security.capability"));
+        assert_eq!(file.mode, 0o100644);
+        fs::remove_dir_all(&temp).unwrap();
+    }
+
+    #[test]
+    fn copy_layer_unlinks_hardlinked_replacement_without_mutating_sibling() {
+        let temp = archive_test_dir("copy-hardlink-overlay");
+        let staging = temp.join("staging");
+        let archive = write_archive_fixture(&temp, "hardlinks.tar", &tar_with_metadata());
+        let mut metadata = CompositionMetadata::default();
+        extract_archive_safe_with_metadata(
+            &archive,
+            ArchiveFormat::Tar,
+            1,
+            &staging.join("root"),
+            &staging,
+            &mut metadata,
+        )
+        .unwrap();
+        let replacement = temp.join("replacement");
+        fs::write(&replacement, b"new").unwrap();
+        let file = ResolvedFile {
+            source: FileSource::Local(replacement),
+            to: "/root/etc/cap".to_string(),
+            template: false,
+        };
+        apply_copy_layer(
+            &file,
+            &staging,
+            &temp.join("cache"),
+            None,
+            &TemplateContext {
+                arch: "aarch64".to_string(),
+                target_triple: "aarch64-unknown-none-elf".to_string(),
+                project: "test".to_string(),
+            },
+            &mut Vec::new(),
+            &mut metadata,
+        )
+        .unwrap();
+
+        assert_eq!(fs::read(staging.join("root/etc/cap")).unwrap(), b"new");
+        assert_eq!(fs::read(staging.join("root/etc/cap-link")).unwrap(), b"cap");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let replaced = fs::metadata(staging.join("root/etc/cap")).unwrap();
+            let sibling = fs::metadata(staging.join("root/etc/cap-link")).unwrap();
+            assert_ne!(
+                (replaced.dev(), replaced.ino()),
+                (sibling.dev(), sibling.ino())
+            );
+        }
+        assert!(
+            !metadata
+                .get(Path::new("root/etc/cap"))
+                .unwrap()
+                .xattrs
+                .contains_key("security.capability")
+        );
+        assert!(
+            metadata
+                .get(Path::new("root/etc/cap-link"))
+                .unwrap()
+                .xattrs
+                .contains_key("security.capability")
+        );
+        fs::remove_dir_all(&temp).unwrap();
+    }
+
+    #[test]
+    fn package_assets_unlink_hardlinked_replacements_and_invalidate_their_metadata() {
+        let temp = archive_test_dir("package-hardlink-overlay");
+        let staging = temp.join("staging");
+        let archive = write_archive_fixture(&temp, "hardlinks.tar", &tar_with_metadata());
+        let mut metadata = CompositionMetadata::default();
+        extract_archive_safe_with_metadata(
+            &archive,
+            ArchiveFormat::Tar,
+            1,
+            &staging.join("root"),
+            &staging,
+            &mut metadata,
+        )
+        .unwrap();
+        let package_source = temp.join("package-source");
+        fs::create_dir_all(package_source.join("etc")).unwrap();
+        fs::write(package_source.join("etc/cap"), b"package").unwrap();
+        let pkg = ResolvedPackage {
+            kind: Some("prebuilt".to_string()),
+            source: None,
+            local_source: None,
+            resolved_rev: None,
+            package_name: None,
+            bin: None,
+            lib: None,
+            subdir: None,
+            features: Vec::new(),
+            default_features: None,
+            from: Some(package_source),
+            to: "/root".to_string(),
+            output: None,
+        };
+        install_package_with_metadata(
+            &staging,
+            &pkg,
+            &temp,
+            "aarch64-unknown-none-elf",
+            "debug",
+            None,
+            &mut metadata,
+        )
+        .unwrap();
+
+        assert_eq!(fs::read(staging.join("root/etc/cap")).unwrap(), b"package");
+        assert_eq!(fs::read(staging.join("root/etc/cap-link")).unwrap(), b"cap");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let replaced = fs::metadata(staging.join("root/etc/cap")).unwrap();
+            let sibling = fs::metadata(staging.join("root/etc/cap-link")).unwrap();
+            assert_ne!(
+                (replaced.dev(), replaced.ino()),
+                (sibling.dev(), sibling.ino())
+            );
+        }
+        assert!(
+            !metadata
+                .get(Path::new("root/etc/cap"))
+                .unwrap()
+                .xattrs
+                .contains_key("security.capability")
+        );
+        assert!(
+            metadata
+                .get(Path::new("root/etc/cap-link"))
+                .unwrap()
+                .xattrs
+                .contains_key("security.capability")
+        );
+        fs::remove_dir_all(&temp).unwrap();
+    }
+
+    #[test]
+    fn image_metadata_overlay_keeps_source_root_attributes() {
+        let mut source = CompositionMetadata::default();
+        source
+            .set_entry(PathBuf::new(), NodeMetadata::directory(501, 502, 0o750))
+            .unwrap();
+        let mut destination = CompositionMetadata::default();
+        destination
+            .overlay_tree(&source, Path::new("systems/imported"))
+            .unwrap();
+        let root = destination
+            .get(Path::new("systems/imported"))
+            .expect("rebased image root metadata");
+        assert_eq!((root.uid, root.gid, root.mode), (501, 502, 0o040750));
+    }
+
+    #[test]
+    fn image_layer_replaces_uncatalogued_files_without_inheriting_old_xattrs() {
+        let temp = archive_test_dir("image-layer-generated-metadata");
+        let source = temp.join("source");
+        let staging = temp.join("staging");
+        let destination = staging.join("imported");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+        fs::write(source.join("generated"), b"new").unwrap();
+        fs::write(destination.join("generated"), b"old").unwrap();
+        let mut metadata = CompositionMetadata::default();
+        let old = NodeMetadata {
+            uid: 111,
+            gid: 222,
+            mode: 0o100755,
+            mtime_sec: 0,
+            mtime_nsec: 0,
+            xattrs: BTreeMap::from([("security.capability".to_string(), vec![1, 2, 3])]),
+        };
+        metadata
+            .set_entry(PathBuf::from("imported/generated"), old)
+            .unwrap();
+        copy_composed_tree(
+            &source,
+            &destination,
+            &staging,
+            Some(&CompositionMetadata::default()),
+            &mut metadata,
+        )
+        .unwrap();
+        assert_eq!(fs::read(destination.join("generated")).unwrap(), b"new");
+        assert!(
+            metadata
+                .get(Path::new("imported/generated"))
+                .unwrap()
+                .xattrs
+                .is_empty()
+        );
         fs::remove_dir_all(&temp).unwrap();
     }
 
@@ -8034,7 +8893,14 @@ to = "/system"
         };
         let staging = temp.join("staging");
         let mut locks = Vec::new();
-        apply_archive_layer(&archive, &staging, &temp.join("cache"), &mut locks).unwrap();
+        apply_archive_layer(
+            &archive,
+            &staging,
+            &temp.join("cache"),
+            &mut locks,
+            &mut CompositionMetadata::default(),
+        )
+        .unwrap();
         assert_eq!(
             fs::read(staging.join("system/foo/etc/issue")).unwrap(),
             b"Scarlet\n"

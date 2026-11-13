@@ -51,7 +51,7 @@ provide a standalone Native C/C++ compiler driver or establish guest execution.
 
 Image generation uses external filesystem and disk-image tools:
 
-- `mke2fs`, `truncate`, `du` for `format = "ext2"` and `format = "gpt-ext2"`
+- `mke2fs`, `debugfs`, `truncate`, `du` for `format = "ext2"` and `format = "gpt-ext2"`
 - `mformat`, `mmd`, and `mcopy` for `format = "limine-uefi"`
 
 Use `format = "ext2"` and `format = "limine-uefi"` to build partition payload images, then `format = "gpt"` to compose those payloads into a GPT disk image. `format = "gpt-ext2"` remains available for simple one-partition root images. GPT partition tables are written through the Rust `gpt` crate.
