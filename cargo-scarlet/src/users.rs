@@ -20,7 +20,7 @@ pub(super) struct User {
 
 #[derive(Default)]
 pub(super) struct Accounts {
-    homes: BTreeMap<String, (u32, u32)>,
+    homes: BTreeMap<PathBuf, (u32, u32)>,
     records: String,
 }
 
@@ -40,19 +40,21 @@ impl Accounts {
                 return Err("invalid console account name".into());
             }
             let gid = user.gid.unwrap_or(user.uid);
-            if [user.uid, gid]
-                .iter()
-                .chain(&user.groups)
-                .any(|&id| id == 0 || id == u32::MAX)
+            let root = name == "root";
+            if (user.uid == 0) != root
+                || (gid == 0) != root
+                || user.uid == u32::MAX
+                || gid == u32::MAX
+                || user.groups.iter().any(|&id| id == 0 || id == u32::MAX)
             {
                 return Err(format!("invalid UID or GID for {name}"));
             }
-            if !uids.insert(user.uid)
-                || accounts
-                    .homes
-                    .insert(name.clone(), (user.uid, gid))
-                    .is_some()
-            {
+            let home = if root {
+                PathBuf::from("root")
+            } else {
+                Path::new("home").join(name)
+            };
+            if !uids.insert(user.uid) || accounts.homes.insert(home, (user.uid, gid)).is_some() {
                 return Err(format!("duplicate console account name or UID for {name}"));
             }
             let hash = match &user.password_hash_file {
@@ -96,12 +98,7 @@ impl Accounts {
         }
         for dir in [PathBuf::from("etc"), PathBuf::from("home")]
             .into_iter()
-            .chain(
-                accounts
-                    .homes
-                    .keys()
-                    .map(|name| Path::new("home").join(name)),
-            )
+            .chain(accounts.homes.keys().cloned())
         {
             let path = staging.join(dir);
             super::ensure_no_symlink_ancestors(staging, &path)?;
@@ -141,11 +138,8 @@ impl Accounts {
             let path = dir.join(entry.file_name());
             let meta = fs::symlink_metadata(entry.path())?;
             let home = path
-                .strip_prefix("home")
-                .ok()
-                .and_then(|p| p.iter().next())
-                .and_then(|name| name.to_str())
-                .and_then(|name| self.homes.get(name));
+                .ancestors()
+                .find_map(|ancestor| self.homes.get(ancestor));
             let (uid, gid) = home.copied().unwrap_or((0, 0));
             let mut h = Header::new_gnu();
             h.set_metadata(&meta);
@@ -153,7 +147,7 @@ impl Accounts {
             h.set_gid(gid.into());
             h.set_mtime(0);
             if meta.is_dir() {
-                if home.is_some() && dir == Path::new("home") {
+                if self.homes.contains_key(&path) {
                     h.set_mode(0o700);
                 }
                 if path == Path::new("etc") || path == Path::new("home") {

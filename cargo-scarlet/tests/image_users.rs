@@ -79,6 +79,10 @@ password-hash-file="hash"
 [[images.rootfs.users]]
 name="bob"
 uid=1002
+[[images.rootfs.users]]
+name="root"
+uid=0
+password-hash-file="hash"
 "#;
     let hash = "$2b$12$L6Bc/AlTQHyd9liGgGEZyOFLPHNgyxeEPfgYfBCVxJ7JIlwxyVU3u";
     fs::write(root.join("scarlet.local.toml"), config).unwrap();
@@ -92,7 +96,7 @@ uid=1002
     let image = root.join("root.ext2");
     assert_eq!(
         debugfs(&image, "cat /etc/scarlet-users"),
-        format!("alice:1001:1010:42:{hash}\nbob:1002:1002::!\n")
+        format!("alice:1001:1010:42:{hash}\nbob:1002:1002::!\nroot:0:0::{hash}\n")
     );
     for (path, mode, uid, gid) in [
         ("/etc/scarlet-users", "0600", "0", "0"),
@@ -100,6 +104,7 @@ uid=1002
         ("/home/alice", "0700", "1001", "1010"),
         ("/home/alice/welcome", "0644", "1001", "1010"),
         ("/home/bob", "0700", "1002", "1002"),
+        ("/root", "0700", "0", "0"),
     ] {
         let stat = debugfs(&image, &format!("stat {path}"));
         let fields = stat.split_whitespace().collect::<Vec<_>>();
@@ -124,5 +129,12 @@ uid=1002
     )
     .unwrap();
     assert!(!build(root).status.success());
+    for bad in [
+        config.replace("uid=0", "uid=4"),
+        config.replace("uid=1002", "uid=0"),
+    ] {
+        fs::write(root.join("scarlet.local.toml"), bad).unwrap();
+        assert!(!build(root).status.success());
+    }
     assert_eq!(debugfs(&image, "cat /etc/scarlet-users"), records);
 }
