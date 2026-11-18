@@ -1,4 +1,5 @@
 mod app;
+mod users;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::fs;
@@ -326,6 +327,8 @@ struct BspConfig<'a> {
 
 #[derive(Debug, Default, Deserialize, Serialize)]
 struct ManifestImageSection {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    users: Vec<users::User>,
     format: Option<String>,
     output: Option<String>,
     /// Minimum ext2 filesystem size; the content-based estimate can exceed it.
@@ -2640,6 +2643,12 @@ fn build_manifest_image(
         let staging_dir = project.join(format!(".scarlet/staging/{}", section_name));
         let format = section_cfg.format.as_deref().unwrap_or("");
 
+        if !section_cfg.users.is_empty() && !matches!(format, "ext2" | "gpt-ext2") {
+            return Err(format!(
+                "image {section_name}: users require an ext2 filesystem"
+            ));
+        }
+
         eprintln!("cargo-scarlet: staging {}...", section_name);
 
         match format {
@@ -2723,7 +2732,25 @@ fn build_manifest_image(
                     }
                 }
 
-                let staging_hash = sha256_dir(&staging_dir)?;
+                let accounts = if section_cfg.users.is_empty() {
+                    None
+                } else {
+                    Some(users::Accounts::prepare(
+                        &section_cfg.users,
+                        project,
+                        &staging_dir,
+                    )?)
+                };
+                let staging_hash = if let Some(users) = &accounts {
+                    let mut hash = Sha256::new();
+                    hash.update(b"scarlet-image-users-v1");
+                    users
+                        .archive(&staging_dir, &mut hash)
+                        .map_err(|e| format!("hash guest tree: {e}"))?;
+                    format!("sha256:{:x}", hash.finalize())
+                } else {
+                    sha256_dir(&staging_dir)?
+                };
                 let image_hash = image_content_hash(
                     format,
                     &staging_hash,
@@ -2753,6 +2780,20 @@ fn build_manifest_image(
 
                 eprintln!("cargo-scarlet: generating {} image...", section_name);
 
+                // Publish provisioned images only after all content and ownership
+                // have been written, retaining the prior bootable image on failure.
+                let temporary = if accounts.is_some() {
+                    let parent = output_path.parent().ok_or("image output has no parent")?;
+                    fs::create_dir_all(parent)
+                        .map_err(|e| format!("create image directory: {e}"))?;
+                    Some(tempfile::tempdir_in(parent).map_err(|e| format!("stage image: {e}"))?)
+                } else {
+                    None
+                };
+                let pending = temporary
+                    .as_ref()
+                    .map(|dir| dir.path().join("filesystem.img"));
+                let destination = pending.as_deref().unwrap_or(&output_path);
                 match format {
                     "newc" => {
                         build_initramfs_newc_from_staging(&staging_dir, &output_path)?;
@@ -2765,7 +2806,8 @@ fn build_manifest_image(
                     "ext2" => {
                         build_ext2_from_staging(
                             &staging_dir,
-                            &output_path,
+                            accounts.as_ref(),
+                            destination,
                             &section_name,
                             section_cfg.min_size_mib,
                             section_cfg.size_mib,
@@ -2774,13 +2816,19 @@ fn build_manifest_image(
                     "gpt-ext2" => {
                         build_gpt_ext2_from_staging(
                             &staging_dir,
-                            &output_path,
+                            accounts.as_ref(),
+                            destination,
                             &section_name,
                             section_cfg.min_size_mib,
                             section_cfg.size_mib,
                         )?;
                     }
                     _ => unreachable!(),
+                }
+
+                if let Some(pending) = pending {
+                    fs::rename(pending, &output_path)
+                        .map_err(|e| format!("publish provisioned image: {e}"))?;
                 }
 
                 write_image_stamp(project, &section_name, &output_path, &image_hash)?;
@@ -3399,6 +3447,7 @@ fn gpt_partition_type(type_name: &str) -> Result<gpt::partition_types::Type, Str
 
 fn build_gpt_ext2_from_staging(
     staging_dir: &Path,
+    accounts: Option<&users::Accounts>,
     output_path: &Path,
     section_name: &str,
     min_size_mib: Option<u64>,
@@ -3427,6 +3476,7 @@ fn build_gpt_ext2_from_staging(
         let partition_image = work_dir.join("rootfs.ext2");
         build_ext2_from_staging(
             staging_dir,
+            accounts,
             &partition_image,
             section_name,
             min_size_mib,
@@ -3559,6 +3609,7 @@ fn ext2_size_kib(
 
 fn build_ext2_from_staging(
     staging_dir: &Path,
+    accounts: Option<&users::Accounts>,
     output_path: &Path,
     section_name: &str,
     min_size_mib: Option<u64>,
@@ -3595,28 +3646,46 @@ fn build_ext2_from_staging(
         return Err("truncate failed".to_string());
     }
 
-    let mke2fs_status = Command::new("mke2fs")
-        .args([
-            "-q",
-            "-F",
-            "-t",
-            "ext2",
-            "-b",
-            "4096",
-            "-i",
-            "2048",
-            "-m",
-            "1",
-            "-L",
-            "SCARLET_ROOT",
-            "-E",
-            "no_copy_xattrs",
-            "-d",
-            staging_dir.to_str().unwrap_or(""),
-            output_path.to_str().unwrap_or(""),
-        ])
-        .status()
-        .map_err(|e| format!("failed to run mke2fs: {e}"))?;
+    let mut mkfs = Command::new("mke2fs");
+    mkfs.args([
+        "-q",
+        "-F",
+        "-t",
+        "ext2",
+        "-b",
+        "4096",
+        "-i",
+        "2048",
+        "-m",
+        "1",
+        "-L",
+        "SCARLET_ROOT",
+        "-E",
+        "no_copy_xattrs",
+        "-d",
+        if accounts.is_some() {
+            "-"
+        } else {
+            staging_dir.to_str().unwrap_or("")
+        },
+        output_path.to_str().unwrap_or(""),
+    ]);
+    let mke2fs_status = if let Some(users) = accounts {
+        let mut child = mkfs
+            .stdin(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("start mke2fs: {e}"))?;
+        let written = users.archive(
+            staging_dir,
+            std::io::BufWriter::new(child.stdin.take().unwrap()),
+        );
+        let status = child.wait().map_err(|e| format!("wait for mke2fs: {e}"))?;
+        written.map_err(|e| format!("populate ext2 guest tree: {e}"))?;
+        status
+    } else {
+        mkfs.status()
+            .map_err(|e| format!("failed to run mke2fs: {e}"))?
+    };
     if !mke2fs_status.success() {
         return Err("mke2fs failed".to_string());
     }
@@ -7018,7 +7087,7 @@ to = "/system/scarlet/bin/video_player"
         fs::create_dir_all(staging.join("etc")).unwrap();
         fs::write(staging.join("etc/issue"), "Scarlet\n").unwrap();
         let output = temp.join("rootfs.ext2");
-        build_ext2_from_staging(&staging, &output, "rootfs", None, Some(65)).unwrap();
+        build_ext2_from_staging(&staging, None, &output, "rootfs", None, Some(65)).unwrap();
         let mut file = fs::File::open(&output).unwrap();
         assert_eq!(file.metadata().unwrap().len(), 65 * 1024 * 1024);
         file.seek(SeekFrom::Start(1024)).unwrap();
@@ -7047,7 +7116,7 @@ to = "/system/scarlet/bin/video_player"
         fs::write(staging.join("etc/issue"), "Scarlet\n").unwrap();
         let output = temp.join("rootfs.img");
 
-        build_gpt_ext2_from_staging(&staging, &output, "rootfs", Some(128), None).unwrap();
+        build_gpt_ext2_from_staging(&staging, None, &output, "rootfs", Some(128), None).unwrap();
 
         let disk = gpt::GptConfig::new().open(&output).unwrap();
         let partition = disk.partitions().get(&1).expect("missing partition 1");
