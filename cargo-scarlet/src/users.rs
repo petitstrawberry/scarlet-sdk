@@ -25,7 +25,12 @@ pub(super) struct Accounts {
 }
 
 impl Accounts {
-    pub(super) fn prepare(users: &[User], project: &Path, staging: &Path) -> Result<Self, String> {
+    pub(super) fn prepare(
+        users: &[User],
+        console_root: bool,
+        project: &Path,
+        staging: &Path,
+    ) -> Result<Self, String> {
         let mut accounts = Accounts::default();
         let mut uids = BTreeSet::new();
         for user in users {
@@ -87,6 +92,10 @@ impl Accounts {
                 user.uid
             )
             .unwrap();
+        }
+        if console_root && !uids.contains(&0) {
+            accounts.homes.insert(PathBuf::from("root"), (0, 0));
+            accounts.records.push_str("root:0:0::\n");
         }
         if accounts.records.len() > 65536 {
             return Err("console account database exceeds 64 KiB".into());

@@ -60,6 +60,7 @@ package="scarlet"
 [bsp.kernel]
 source={path="kernel"}
 [images.rootfs]
+console-root=true
 format="ext2"
 output="root.ext2"
 [[images.rootfs.layers]]
@@ -87,6 +88,13 @@ password-hash-file="hash"
     let hash = "$2b$12$L6Bc/AlTQHyd9liGgGEZyOFLPHNgyxeEPfgYfBCVxJ7JIlwxyVU3u";
     fs::write(root.join("scarlet.local.toml"), config).unwrap();
     fs::write(root.join("hash"), hash).unwrap();
+    fs::remove_file(root.join("scarlet.local.toml")).unwrap();
+    assert!(build(root).status.success());
+    assert_eq!(
+        debugfs(&root.join("root.ext2"), "cat /etc/scarlet-users"),
+        "root:0:0::\n"
+    );
+    fs::write(root.join("scarlet.local.toml"), config).unwrap();
     let first = build(root);
     assert!(
         first.status.success(),

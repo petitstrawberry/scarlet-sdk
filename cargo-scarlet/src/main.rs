@@ -327,6 +327,8 @@ struct BspConfig<'a> {
 
 #[derive(Debug, Default, Deserialize, Serialize)]
 struct ManifestImageSection {
+    #[serde(default, rename = "console-root")]
+    console_root: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     users: Vec<users::User>,
     format: Option<String>,
@@ -2643,7 +2645,9 @@ fn build_manifest_image(
         let staging_dir = project.join(format!(".scarlet/staging/{}", section_name));
         let format = section_cfg.format.as_deref().unwrap_or("");
 
-        if !section_cfg.users.is_empty() && !matches!(format, "ext2" | "gpt-ext2") {
+        if (section_cfg.console_root || !section_cfg.users.is_empty())
+            && !matches!(format, "ext2" | "gpt-ext2")
+        {
             return Err(format!(
                 "image {section_name}: users require an ext2 filesystem"
             ));
@@ -2732,11 +2736,12 @@ fn build_manifest_image(
                     }
                 }
 
-                let accounts = if section_cfg.users.is_empty() {
+                let accounts = if !section_cfg.console_root && section_cfg.users.is_empty() {
                     None
                 } else {
                     Some(users::Accounts::prepare(
                         &section_cfg.users,
+                        section_cfg.console_root,
                         project,
                         &staging_dir,
                     )?)
