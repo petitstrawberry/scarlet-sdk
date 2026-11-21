@@ -313,6 +313,10 @@ cargo-config = ".cargo/userspace.toml"
 `cargo scarlet image` passes this file with `cargo --config` to every userspace
 package build. Put userspace patches or target flags there; BSP kernel target,
 linker, and `build-std` settings stay in the BSP's own `.cargo/config.toml`.
+BSP configurations may use built-in Rust targets such as
+`aarch64-apple-darwin` or a path to a custom JSON target. Runtime kernel
+symbol injection applies to ELF executables. Native Mach-O BSPs can use
+an image manifest and its runner with the standard `image` and `run` commands.
 
 Then build and run:
 

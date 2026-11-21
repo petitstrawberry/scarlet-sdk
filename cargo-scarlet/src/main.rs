@@ -1219,18 +1219,24 @@ fn disabled_feature_names(features: &BTreeMap<String, bool>) -> Vec<String> {
 }
 
 fn target_triple_from_build_target(build_target: &str) -> Result<String, String> {
-    Path::new(build_target)
-        .file_stem()
-        .ok_or_else(|| format!("target path has no file stem: {build_target}"))
+    let path = Path::new(build_target);
+    let name = if path.extension().is_some_and(|ext| ext == "json") {
+        path.file_stem()
+    } else {
+        path.file_name()
+    };
+    name.ok_or_else(|| format!("target has no name: {build_target}"))
         .map(|stem| stem.to_string_lossy().to_string())
 }
 
 fn build_target_arg(bsp_root: &Path, build_target: &str) -> String {
     let path = Path::new(build_target);
-    if path.is_absolute() {
-        build_target.to_string()
-    } else {
+    let relative_path = !path.is_absolute()
+        && (path.extension().is_some_and(|ext| ext == "json") || path.components().count() > 1);
+    if relative_path {
         bsp_root.join(path).display().to_string()
+    } else {
+        build_target.to_string()
     }
 }
 
@@ -2433,6 +2439,18 @@ fn refresh_bsp_lock(project: &Path, bsp_root: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn is_elf_binary(path: &Path) -> Result<bool, String> {
+    let mut magic = [0; 4];
+    match fs::File::open(path).and_then(|mut file| file.read_exact(&mut magic)) {
+        Ok(()) => Ok(magic == *b"\x7fELF"),
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(error) => Err(format!(
+            "failed to read BSP executable {}: {error}",
+            path.display()
+        )),
+    }
+}
+
 fn inject_ksym_section_manifest(
     project: &Path,
     expanded: &ExpandedManifest,
@@ -2459,6 +2477,10 @@ fn inject_ksym_section_manifest(
             "cargo-scarlet: ksym: binary not found at {}, skipping",
             binary_path.display()
         );
+        return Ok(());
+    }
+
+    if !is_elf_binary(&binary_path)? {
         return Ok(());
     }
 
@@ -2589,7 +2611,7 @@ fn build_manifest_image(
                 .join(profile)
                 .join("scarlet");
             if !path.exists() {
-                return Err(format!("kernel ELF not found: {}", path.display()));
+                return Err(format!("BSP executable not found: {}", path.display()));
             }
             path
         }
@@ -5889,6 +5911,46 @@ mod tests {
             Some(fs::canonicalize(config).unwrap())
         );
         fs::remove_dir_all(project).unwrap();
+    }
+
+    #[test]
+    fn built_in_bsp_targets_and_json_target_paths() {
+        let bsp = Path::new("/project/bsp");
+        for (target, cargo_arg, target_dir) in [
+            (
+                "aarch64-apple-darwin",
+                "aarch64-apple-darwin",
+                "aarch64-apple-darwin",
+            ),
+            (
+                "thumbv8m.main-none-eabi",
+                "thumbv8m.main-none-eabi",
+                "thumbv8m.main-none-eabi",
+            ),
+            ("target.json", "/project/bsp/target.json", "target"),
+            (
+                "targets/aarch64.json",
+                "/project/bsp/targets/aarch64.json",
+                "aarch64",
+            ),
+            ("/targets/riscv64.json", "/targets/riscv64.json", "riscv64"),
+        ] {
+            assert_eq!(build_target_arg(bsp, target), cargo_arg);
+            assert_eq!(target_triple_from_build_target(target).unwrap(), target_dir);
+        }
+    }
+
+    #[test]
+    fn only_elf_bsp_artifacts_qualify_for_symbol_injection() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        for (magic, expected) in [
+            (&b"\x7fELF"[..], true),
+            (&b"\xcf\xfa\xed\xfe"[..], false),
+            (&b""[..], false),
+        ] {
+            fs::write(file.path(), magic).unwrap();
+            assert_eq!(is_elf_binary(file.path()).unwrap(), expected);
+        }
     }
 
     #[test]
